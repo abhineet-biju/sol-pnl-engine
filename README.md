@@ -1,6 +1,6 @@
-# sol-balance-runtime
+# sol-pnl-engine
 
-Reconstructs a Solana wallet's **native SOL balance over time** using only Helius [`getTransactionsForAddress`](https://docs.helius.dev/solana-rpc-nodes/enhanced-methods/getTransactionsForAddress). No indexing, no database, just RPC.
+Reconstructs a Solana wallet's **native SOL balance over time** using only Helius [`getTransactionsForAddress`](https://www.helius.dev/docs/rpc/gettransactionsforaddress). No indexing, no database, just RPC.
 
 Built for [Mert's latency challenge](https://x.com/mert/status/2042941421297050109?s=20): lowest average latency for SOL balance reconstruction across busy, sparse, and periodic wallets.
 
@@ -32,14 +32,14 @@ The algorithm exploits `getTransactionsForAddress`'s bidirectional sorting and s
 | Wallet type | What happens | Signature requests |
 |---|---|---|
 | Small (<=1000 txs) | Two parallel boundary probes cover the entire history | **2** |
-| Dense (very large, high-headroom) | Boundary probes plus validated seeded full-page fanout from multiple entry points | **2** |
+| Dense (very large, high-headroom) | Boundary probes, a small density histogram, then validated seeded full-page fanout from multiple entry points | **low teens, but parallelized** |
 | Dense (thousands of txs) | Bidirectional pincer sweep by default, with fallback dense fanout when seeded mode is not a fit | **~2 per 1000 txs** |
 | Sparse (gaps between activity) | Recursive binary search over slot ranges with adaptive subrange splitting | **varies, but parallelized** |
 
 **Key optimizations:**
 
 - **Pipelined fetching**: for dense wallets, full-transaction fetches fire as soon as each signature page arrives, overlapping discovery and data retrieval. Phases 2 and 3 run concurrently, not sequentially.
-- **Validated seeded full fanout**: for very large dense wallets with enough RPC headroom, the scanner validates whether synthetic `slot:txIndex` pagination behaves correctly on the current endpoint. If it does, the scanner fans out full-page requests from multiple seeded entry points and collapses discovery down to the two boundary signature probes.
+- **Density-sampled seeded full fanout**: for very large dense wallets with enough RPC headroom, the scanner validates whether synthetic `slot:txIndex` pagination behaves correctly on the current endpoint. If it does, the scanner first builds a small parallel signature-density histogram and then fans out full-page requests from density-weighted seeded entry points. This keeps the seeded segments balanced even when activity is clustered instead of uniform across slot space.
 - **Dense fanout when it helps**: for very large, clearly dense wallets with enough concurrency and RPC headroom, the scanner switches from a stepwise pincer walk to parallel range discovery. Smaller or rate-limited runs keep the lower-call-count pincer path.
 - **Sparse-gap confirmation**: when a very large wallet initially looks sparse from the boundary pages alone, the scanner sends a midpoint confirmation probe before committing to recursive search. This prevents uniform high-volume histories from being misclassified as sparse.
 - **Signatures-first discovery**: uses `transactionDetails: signatures` (lightweight) to map the history before requesting full transactions (heavy). This minimizes bandwidth and response times during the search phase.
@@ -119,7 +119,7 @@ If they don't overlap, the gap between the two frontiers determines whether the 
 
 ### Phase 2: discover all signatures
 
-**Dense path**: the two boundary pages didn't overlap, but the gap is compact relative to the covered span (gap < 8x the already-covered slot range). For the biggest dense histories, the scanner first validates a seeded full-page fast path using synthetic `slot:txIndex` pagination. When the endpoint accepts that pattern, the scanner fans out directly into full transaction pages from multiple seeded entry points and reconstructs the timeline with only the two boundary signature probes.
+**Dense path**: the two boundary pages didn't overlap, but the gap is compact relative to the covered span (gap < 8x the already-covered slot range). For the biggest dense histories, the scanner first validates a seeded full-page fast path using synthetic `slot:txIndex` pagination. When the endpoint accepts that pattern, the scanner sends a small parallel signature-density sampling pass, uses it to estimate how much history sits in each slot band, and then fans out directly into full transaction pages from density-weighted seeded entry points.
 
 If seeded pagination is not accepted, or if the run is rate-limited, the scanner falls back to the lower-risk dense strategies already in the engine. The default fallback continues paginating from both ends simultaneously, letting the two cursors meet in the middle, and a secondary dense fanout mode can switch to parallel range discovery when signature-round latency is the bottleneck. As each dense signature page arrives, its corresponding full-transaction fetch jobs are **immediately dispatched**.
 
@@ -131,7 +131,7 @@ If seeded pagination is not accepted, or if the run is rate-limited, the scanner
 
 Discovered signatures are grouped into bounded full-fetch jobs (max `fullLimit` transactions per page, default 100). Each job specifies a slot range and expected count. Jobs run concurrently, controlled by the concurrency semaphore.
 
-For the dense pincer fallback, this phase is pipelined with Phase 2. Jobs are already in-flight by the time discovery finishes. For the seeded fast path, discovery and retrieval are the same full-page requests.
+For the dense pincer fallback, this phase is pipelined with Phase 2. Jobs are already in-flight by the time discovery finishes. For the seeded fast path, discovery and retrieval are the same full-page requests after the density sampler chooses balanced starting points.
 
 ### Phase 4: reconstruct SOL balance over time
 

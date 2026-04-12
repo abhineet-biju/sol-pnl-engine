@@ -43,6 +43,8 @@ const SEEDED_FANOUT_MIN_SLOT_SPAN_MULTIPLIER: u64 = 8;
 const SEEDED_FANOUT_MAX_SEGMENTS: usize = 32;
 const SEEDED_FANOUT_TARGET_PAGES_PER_SEGMENT: usize = 6;
 const SEEDED_FANOUT_VALIDATION_TOLERANCE_DIVISOR: u64 = 8;
+const SEEDED_FANOUT_DENSITY_SAMPLE_MAX_WINDOWS: usize = 8;
+const SEEDED_FANOUT_DENSITY_PROBE_LIMIT: usize = 256;
 const SPARSE_CONFIRMATION_MIN_SAMPLE_SIZE: usize = 256;
 const SPARSE_CONFIRMATION_SHRINK_FACTOR: u64 = 4;
 
@@ -71,6 +73,13 @@ struct SeededFanoutResult {
     signatures: Vec<SignatureRecord>,
     full_transactions: Vec<FullTransactionRecord>,
     fetch_jobs: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SeededDensitySample {
+    estimated_signatures: usize,
+    occupied_start_slot: u64,
+    occupied_end_slot: u64,
 }
 
 struct DenseEdgePagination {
@@ -803,12 +812,16 @@ async fn try_seeded_dense_full_fanout(
     }
 
     let segments = plan_seeded_fanout_segments(
+        client,
+        address,
+        context.clone(),
         config,
         full_limit,
         estimated_signatures,
         &left_frontier,
         &right_frontier,
-    );
+    )
+    .await?;
 
     let mut segment_futures = FuturesUnordered::new();
     for segment in segments.clone() {
@@ -892,23 +905,83 @@ struct SeededFanoutSegment {
     upper_exclusive: Option<SignatureRecord>,
 }
 
-fn plan_seeded_fanout_segments(
+async fn plan_seeded_fanout_segments(
+    client: &(impl TransactionsSource + ?Sized),
+    address: &str,
+    context: ScanContext,
     config: &RuntimeScanConfig,
     full_limit: usize,
     estimated_signatures: usize,
     left_frontier: &FullTransactionRecord,
     right_frontier: &FullTransactionRecord,
-) -> Vec<SeededFanoutSegment> {
-    let max_segments = config.concurrency.min(SEEDED_FANOUT_MAX_SEGMENTS).max(4);
-    let estimated_pages = estimated_signatures.div_ceil(full_limit.max(1));
-    let segment_count = estimated_pages
-        .div_ceil(SEEDED_FANOUT_TARGET_PAGES_PER_SEGMENT)
-        .clamp(4, max_segments);
-
+) -> Result<Vec<SeededFanoutSegment>, ScanError> {
     let start = left_frontier.slot;
     let end = right_frontier.slot;
-    let slot_span = end.saturating_sub(start).saturating_add(1);
+    let provisional_segment_count =
+        seeded_fanout_segment_count(config, full_limit, estimated_signatures);
+    let sampled_density = match sample_seeded_fanout_density(
+        client,
+        address,
+        context,
+        config,
+        provisional_segment_count,
+        SlotRange { start, end },
+    )
+    .await
+    {
+        Ok(samples) => Some(samples),
+        Err(ScanError::Client(_)) => None,
+        Err(error) => return Err(error),
+    };
+    let sampled_estimated_signatures = sampled_density
+        .as_ref()
+        .map(|samples| {
+            samples
+                .iter()
+                .map(|sample| sample.estimated_signatures)
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    let segment_count = seeded_fanout_segment_count(
+        config,
+        full_limit,
+        estimated_signatures.max(sampled_estimated_signatures),
+    );
+    let uniform_starts = uniform_seeded_start_slots(segment_count, start, end);
+    let start_slots = sampled_density
+        .as_ref()
+        .and_then(|samples| {
+            build_density_weighted_start_slots(
+                segment_count,
+                start,
+                end,
+                samples,
+                &uniform_starts,
+            )
+        })
+        .unwrap_or(uniform_starts);
 
+    Ok(build_seeded_segments_from_start_slots(
+        start_slots,
+        left_frontier,
+        right_frontier,
+    ))
+}
+
+fn seeded_fanout_segment_count(
+    config: &RuntimeScanConfig,
+    full_limit: usize,
+    estimated_signatures: usize,
+) -> usize {
+    let max_segments = config.concurrency.min(SEEDED_FANOUT_MAX_SEGMENTS).max(4);
+    let estimated_pages = estimated_signatures.div_ceil(full_limit.max(1));
+    estimated_pages
+        .div_ceil(SEEDED_FANOUT_TARGET_PAGES_PER_SEGMENT)
+        .clamp(4, max_segments)
+}
+
+fn uniform_seeded_start_slots(segment_count: usize, start: u64, end: u64) -> Vec<u64> {
+    let slot_span = end.saturating_sub(start).saturating_add(1);
     let mut start_slots = Vec::new();
     for index in 0..segment_count {
         let offset = ((u128::from(slot_span) * index as u128) / segment_count as u128)
@@ -923,6 +996,245 @@ fn plan_seeded_fanout_segments(
         start_slots.push(start);
     }
 
+    start_slots
+}
+
+async fn sample_seeded_fanout_density(
+    client: &(impl TransactionsSource + ?Sized),
+    address: &str,
+    context: ScanContext,
+    config: &RuntimeScanConfig,
+    segment_count_hint: usize,
+    range: SlotRange,
+) -> Result<Vec<SeededDensitySample>, ScanError> {
+    let probe_limit = config
+        .scout_limit
+        .clamp(1, SEEDED_FANOUT_DENSITY_PROBE_LIMIT);
+    let window_count = segment_count_hint
+        .saturating_mul(2)
+        .clamp(4, SEEDED_FANOUT_DENSITY_SAMPLE_MAX_WINDOWS);
+    let windows = seeded_density_windows(range, window_count);
+
+    let mut futures = FuturesUnordered::new();
+    for window in windows {
+        futures.push(probe_seeded_density_window(
+            client,
+            address,
+            context.clone(),
+            window,
+            probe_limit,
+        ));
+    }
+
+    let mut samples = Vec::new();
+    while let Some(sample_result) = futures.next().await {
+        if let Some(sample) = sample_result? {
+            samples.push(sample);
+        }
+    }
+
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    samples.sort_by_key(|sample| sample.occupied_start_slot);
+    Ok(samples)
+}
+
+fn seeded_density_windows(range: SlotRange, window_count: usize) -> Vec<SlotRange> {
+    let span = range.span();
+    let mut windows = Vec::new();
+
+    for index in 0..window_count {
+        let start_offset =
+            ((u128::from(span) * index as u128) / window_count as u128).min(u128::from(u64::MAX))
+                as u64;
+        let end_offset = ((u128::from(span) * (index + 1) as u128) / window_count as u128)
+            .min(u128::from(u64::MAX)) as u64;
+        let start = range.start.saturating_add(start_offset);
+        let end = range
+            .start
+            .saturating_add(end_offset.saturating_sub(1))
+            .min(range.end);
+
+        if start <= end {
+            windows.push(SlotRange { start, end });
+        }
+    }
+
+    if windows.is_empty() {
+        windows.push(range);
+    }
+
+    windows
+}
+
+async fn probe_seeded_density_window(
+    client: &(impl TransactionsSource + ?Sized),
+    address: &str,
+    context: ScanContext,
+    range: SlotRange,
+    probe_limit: usize,
+) -> Result<Option<SeededDensitySample>, ScanError> {
+    let (asc_page, desc_page) = tokio::join!(
+        get_signatures_page(
+            client,
+            address,
+            context.clone(),
+            range,
+            SortOrder::Asc,
+            probe_limit,
+            None,
+        ),
+        get_signatures_page(
+            client,
+            address,
+            context,
+            range,
+            SortOrder::Desc,
+            probe_limit,
+            None,
+        )
+    );
+
+    let asc_page = asc_page?;
+    let desc_page = desc_page?;
+    let occupied_start_slot = asc_page
+        .data
+        .first()
+        .map(|record| record.slot)
+        .or_else(|| desc_page.data.last().map(|record| record.slot));
+    let occupied_end_slot = desc_page
+        .data
+        .first()
+        .map(|record| record.slot)
+        .or_else(|| asc_page.data.last().map(|record| record.slot));
+
+    let (Some(occupied_start_slot), Some(occupied_end_slot)) =
+        (occupied_start_slot, occupied_end_slot)
+    else {
+        return Ok(None);
+    };
+
+    let estimated_signatures = estimate_seeded_window_signature_count(&asc_page, &desc_page, range);
+    if estimated_signatures == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(SeededDensitySample {
+        estimated_signatures,
+        occupied_start_slot,
+        occupied_end_slot,
+    }))
+}
+
+fn estimate_seeded_window_signature_count(
+    asc_page: &GtfaPage<SignatureRecord>,
+    desc_page: &GtfaPage<SignatureRecord>,
+    range: SlotRange,
+) -> usize {
+    let observed = merged_unique_signature_count(asc_page, desc_page);
+    if observed == 0 {
+        return 0;
+    }
+
+    if pages_cover_complete_history(asc_page, desc_page) {
+        return observed;
+    }
+
+    estimate_dense_signature_count(asc_page, desc_page, range)
+        .unwrap_or(observed)
+        .max(observed)
+}
+
+fn merged_unique_signature_count(
+    asc_page: &GtfaPage<SignatureRecord>,
+    desc_page: &GtfaPage<SignatureRecord>,
+) -> usize {
+    let mut merged = asc_page.data.clone();
+    merged.extend(desc_page.data.clone());
+    sort_and_dedup_signatures(&mut merged);
+    merged.len()
+}
+
+fn build_density_weighted_start_slots(
+    segment_count: usize,
+    range_start: u64,
+    range_end: u64,
+    samples: &[SeededDensitySample],
+    uniform_starts: &[u64],
+) -> Option<Vec<u64>> {
+    let total_estimated = samples
+        .iter()
+        .map(|sample| sample.estimated_signatures)
+        .sum::<usize>();
+    if total_estimated == 0 {
+        return None;
+    }
+
+    let mut start_slots = vec![range_start];
+    let mut cumulative = 0usize;
+    let mut target_index = 1usize;
+
+    for sample in samples {
+        while target_index < segment_count {
+            let target = (total_estimated * target_index) / segment_count;
+            if target >= cumulative.saturating_add(sample.estimated_signatures) {
+                break;
+            }
+
+            let slot = density_quantile_slot(sample, target.saturating_sub(cumulative));
+            if start_slots.last().copied() != Some(slot) {
+                start_slots.push(slot.min(range_end));
+            }
+            target_index += 1;
+        }
+
+        cumulative = cumulative.saturating_add(sample.estimated_signatures);
+    }
+
+    if start_slots.len() < uniform_starts.len().saturating_div(2).max(2) {
+        return None;
+    }
+
+    while start_slots.len() < uniform_starts.len() {
+        let fallback_slot = uniform_starts[start_slots.len()];
+        if start_slots.last().copied() != Some(fallback_slot) {
+            start_slots.push(fallback_slot);
+        } else {
+            break;
+        }
+    }
+
+    if start_slots.is_empty() {
+        start_slots.push(range_start);
+    }
+
+    Some(start_slots)
+}
+
+fn density_quantile_slot(sample: &SeededDensitySample, count_within_sample: usize) -> u64 {
+    let occupied_start = sample.occupied_start_slot;
+    let occupied_end = sample.occupied_end_slot.max(occupied_start);
+    let occupied_span = occupied_end.saturating_sub(occupied_start).saturating_add(1);
+    if sample.estimated_signatures <= 1 || occupied_span <= 1 {
+        return occupied_start;
+    }
+
+    let offset = ((u128::from(occupied_span) * count_within_sample as u128)
+        / sample.estimated_signatures as u128)
+        .min(u128::from(u64::MAX)) as u64;
+
+    occupied_start
+        .saturating_add(offset)
+        .min(occupied_end)
+}
+
+fn build_seeded_segments_from_start_slots(
+    start_slots: Vec<u64>,
+    left_frontier: &FullTransactionRecord,
+    right_frontier: &FullTransactionRecord,
+) -> Vec<SeededFanoutSegment> {
     start_slots
         .iter()
         .enumerate()
@@ -2104,8 +2416,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::{
-        FullFetchJob, RuntimeScanConfig, ScanStrategy, StrategyPreference, build_full_fetch_jobs,
-        build_timeline_entries, reconstruct_sol_balance_timeline, sort_and_dedup_signatures,
+        FullFetchJob, RuntimeScanConfig, ScanStrategy, SeededDensitySample, StrategyPreference,
+        build_density_weighted_start_slots, build_full_fetch_jobs, build_timeline_entries,
+        reconstruct_sol_balance_timeline, sort_and_dedup_signatures,
     };
     use crate::client::{FixtureClient, FixtureData};
     use crate::model::{
@@ -2205,6 +2518,34 @@ mod tests {
                 signature(11, 0, "c"),
             ]
         );
+    }
+
+    #[test]
+    fn density_weighted_starts_bias_toward_dense_windows() {
+        let samples = vec![
+            SeededDensitySample {
+                estimated_signatures: 50,
+                occupied_start_slot: 0,
+                occupied_end_slot: 99,
+            },
+            SeededDensitySample {
+                estimated_signatures: 900,
+                occupied_start_slot: 100,
+                occupied_end_slot: 199,
+            },
+            SeededDensitySample {
+                estimated_signatures: 50,
+                occupied_start_slot: 200,
+                occupied_end_slot: 299,
+            },
+        ];
+
+        let starts =
+            build_density_weighted_start_slots(6, 0, 299, &samples, &[0, 50, 100, 150, 200, 250])
+                .expect("density weighted slots");
+
+        assert_eq!(starts.first().copied(), Some(0));
+        assert!(starts.iter().filter(|slot| **slot >= 100 && **slot < 200).count() >= 3);
     }
 
     #[test]
@@ -2517,7 +2858,7 @@ mod tests {
         .expect("scan output");
 
         assert_eq!(output.entries.len(), 20_000);
-        assert_eq!(output.stats.signature_requests, 2);
+        assert!(output.stats.signature_requests >= 2);
         assert_eq!(output.stats.max_discovery_depth, 0);
         assert!(output.stats.full_requests > 200);
         assert_eq!(output.strategy, ScanStrategy::SeededFullFanout);
@@ -2565,7 +2906,7 @@ mod tests {
         assert_eq!(output.entries.len(), 20_000);
         assert_eq!(output.initial_balance_lamports, Some(0));
         assert_eq!(output.final_balance_lamports, Some(20_000));
-        assert_eq!(output.stats.signature_requests, 2);
+        assert!(output.stats.signature_requests >= 2);
         assert_eq!(output.stats.max_discovery_depth, 0);
         assert_eq!(output.strategy, ScanStrategy::SeededFullFanout);
     }
