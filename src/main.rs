@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use sol_balance_runtime::{
     FixtureClient, HeliusClient, HeliusClientTimingStats, RuntimeScanConfig, ScanError,
-    TransactionsSource, reconstruct_sol_balance_timeline,
+    StrategyPreference, TransactionsSource, reconstruct_sol_balance_timeline,
 };
 
 #[derive(Debug, Parser)]
@@ -69,6 +69,13 @@ struct Cli {
         help = "Page size for full transaction requests (1..=100)"
     )]
     full_limit: usize,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = CliStrategyPreference::Auto,
+        help = "Optional strategy preference for benchmarking and tuning. Auto keeps the normal classifier."
+    )]
+    strategy_preference: CliStrategyPreference,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -77,6 +84,16 @@ enum HeliusPlan {
     Business,
     Professional,
     Enterprise,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum CliStrategyPreference {
+    #[default]
+    Auto,
+    SeededFullFanout,
+    DensePincer,
+    DenseParallelRange,
+    SparseRecursive,
 }
 
 const DEFAULT_CONCURRENCY: usize = 32;
@@ -94,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         concurrency,
         scout_limit,
         full_limit,
+        strategy_preference,
     } = Cli::parse();
 
     let effective_rpc_rps = resolve_rpc_rps(plan, rpc_rps);
@@ -103,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scout_limit: scout_limit.clamp(1, 1000),
         full_limit: full_limit.clamp(1, 100),
         rpc_rps: effective_rpc_rps,
+        strategy_preference: map_strategy_preference(strategy_preference),
     };
 
     let scan_started_at = Instant::now();
@@ -238,7 +257,7 @@ fn emit_scan_summary(
 
     if let Some(timing) = live_timing_stats {
         eprintln!(
-            "http attempts: {} | retries: {} | total http time: {} | avg per attempt: {}",
+            "http attempts: {} | retries: {} | cumulative http time: {} | avg per attempt: {}",
             timing.attempts,
             timing.retries,
             format_duration(Duration::from_millis(timing.total_http_time_ms)),
@@ -254,6 +273,16 @@ fn emit_scan_summary(
                 .map(|millis| format_millis(millis as f64))
                 .unwrap_or_else(|| "n/a".to_owned())
         );
+    }
+}
+
+fn map_strategy_preference(preference: CliStrategyPreference) -> StrategyPreference {
+    match preference {
+        CliStrategyPreference::Auto => StrategyPreference::Auto,
+        CliStrategyPreference::SeededFullFanout => StrategyPreference::SeededFullFanout,
+        CliStrategyPreference::DensePincer => StrategyPreference::DensePincer,
+        CliStrategyPreference::DenseParallelRange => StrategyPreference::DenseParallelRange,
+        CliStrategyPreference::SparseRecursive => StrategyPreference::SparseRecursive,
     }
 }
 

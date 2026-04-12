@@ -125,6 +125,15 @@ impl ScanStrategy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrategyPreference {
+    Auto,
+    SeededFullFanout,
+    DensePincer,
+    DenseParallelRange,
+    SparseRecursive,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TimelineOutput {
     pub address: String,
@@ -141,6 +150,7 @@ pub struct RuntimeScanConfig {
     pub scout_limit: usize,
     pub full_limit: usize,
     pub rpc_rps: Option<u32>,
+    pub strategy_preference: StrategyPreference,
 }
 
 impl Default for RuntimeScanConfig {
@@ -150,6 +160,7 @@ impl Default for RuntimeScanConfig {
             scout_limit: 1000,
             full_limit: 100,
             rpc_rps: None,
+            strategy_preference: StrategyPreference::Auto,
         }
     }
 }
@@ -290,6 +301,19 @@ pub async fn reconstruct_sol_balance_timeline(
     let mut prefetched_full_transactions = None;
     let mut prefetched_fetch_jobs = None;
     let mut prefetched_signatures = None;
+    let prefer_seeded = matches!(
+        config.strategy_preference,
+        StrategyPreference::SeededFullFanout
+    );
+    let prefer_pincer = matches!(config.strategy_preference, StrategyPreference::DensePincer);
+    let prefer_parallel = matches!(
+        config.strategy_preference,
+        StrategyPreference::DenseParallelRange
+    );
+    let prefer_sparse = matches!(
+        config.strategy_preference,
+        StrategyPreference::SparseRecursive
+    );
 
     let mut strategy = if history_fits_boundary_pages {
         ScanStrategy::BoundaryOnly
@@ -313,12 +337,16 @@ pub async fn reconstruct_sol_balance_timeline(
             .cloned()
             .expect("non-empty boundary page");
 
-        let should_try_seeded_fanout = should_use_seeded_dense_full_fanout(
-            &config,
-            &oldest_page,
-            &newest_page,
-            signature_range,
-        );
+        let should_try_seeded_fanout = prefer_seeded
+            || (!prefer_pincer
+                && !prefer_parallel
+                && !prefer_sparse
+                && should_use_seeded_dense_full_fanout(
+                    &config,
+                    &oldest_page,
+                    &newest_page,
+                    signature_range,
+                ));
 
         if should_try_seeded_fanout {
             match try_seeded_dense_full_fanout(
@@ -344,6 +372,10 @@ pub async fn reconstruct_sol_balance_timeline(
         }
 
         let should_use_sparse_search = if prefetched_full_transactions.is_some() {
+            false
+        } else if prefer_sparse {
+            true
+        } else if prefer_pincer || prefer_parallel || prefer_seeded {
             false
         } else if should_use_sparse_gap_search(&oldest_page, &newest_page) {
             if should_confirm_sparse_gap_classification(
@@ -390,12 +422,15 @@ pub async fn reconstruct_sol_balance_timeline(
                 merged.extend(middle);
                 merged
             })?
-        } else if should_use_parallel_dense_range_search(
-            &config,
-            &oldest_page,
-            &newest_page,
-            signature_range,
-        ) {
+        } else if prefer_parallel
+            || (!prefer_pincer
+                && should_use_parallel_dense_range_search(
+                    &config,
+                    &oldest_page,
+                    &newest_page,
+                    signature_range,
+                ))
+        {
             strategy = ScanStrategy::DenseParallelRange;
             let mut signatures = oldest_page.data.clone();
             signatures.extend(newest_page.data.clone());
@@ -2069,7 +2104,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::{
-        FullFetchJob, RuntimeScanConfig, ScanStrategy, build_full_fetch_jobs,
+        FullFetchJob, RuntimeScanConfig, ScanStrategy, StrategyPreference, build_full_fetch_jobs,
         build_timeline_entries, reconstruct_sol_balance_timeline, sort_and_dedup_signatures,
     };
     use crate::client::{FixtureClient, FixtureData};
@@ -2320,6 +2355,7 @@ mod tests {
                 scout_limit: 2,
                 full_limit: 2,
                 rpc_rps: None,
+                strategy_preference: StrategyPreference::Auto,
             },
         )
         .await
@@ -2361,6 +2397,7 @@ mod tests {
                 scout_limit: 1000,
                 full_limit: 2,
                 rpc_rps: None,
+                strategy_preference: StrategyPreference::Auto,
             },
         )
         .await
@@ -2392,6 +2429,7 @@ mod tests {
                 scout_limit: 1,
                 full_limit: 2,
                 rpc_rps: None,
+                strategy_preference: StrategyPreference::Auto,
             },
         )
         .await
@@ -2431,6 +2469,7 @@ mod tests {
                 scout_limit: 1000,
                 full_limit: 100,
                 rpc_rps: None,
+                strategy_preference: StrategyPreference::Auto,
             },
         )
         .await
@@ -2471,6 +2510,7 @@ mod tests {
                 scout_limit: 1000,
                 full_limit: 100,
                 rpc_rps: None,
+                strategy_preference: StrategyPreference::Auto,
             },
         )
         .await
@@ -2516,6 +2556,7 @@ mod tests {
                 scout_limit: 1000,
                 full_limit: 100,
                 rpc_rps: None,
+                strategy_preference: StrategyPreference::Auto,
             },
         )
         .await
@@ -2558,6 +2599,7 @@ mod tests {
                 scout_limit: 1000,
                 full_limit: 100,
                 rpc_rps: Some(100),
+                strategy_preference: StrategyPreference::Auto,
             },
         )
         .await
@@ -2567,6 +2609,46 @@ mod tests {
         assert_eq!(output.stats.max_discovery_depth, 0);
         assert_eq!(output.stats.signature_requests, 24);
         assert_eq!(output.strategy, ScanStrategy::DensePincer);
+    }
+
+    #[tokio::test]
+    async fn strategy_preference_can_force_dense_pincer() {
+        let transactions = (0..20_000u32)
+            .map(|index| {
+                full_tx(
+                    "target",
+                    &format!("sig-{index}"),
+                    u64::from(index) + 1,
+                    0,
+                    u64::from(index),
+                    u64::from(index) + 1,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let client = FixtureClient::from_fixture(FixtureData {
+            address: Some("target".to_owned()),
+            transactions,
+        })
+        .expect("fixture client");
+
+        let output = reconstruct_sol_balance_timeline(
+            &client,
+            "target",
+            RuntimeScanConfig {
+                concurrency: 64,
+                scout_limit: 1000,
+                full_limit: 100,
+                rpc_rps: None,
+                strategy_preference: StrategyPreference::DensePincer,
+            },
+        )
+        .await
+        .expect("scan output");
+
+        assert_eq!(output.entries.len(), 20_000);
+        assert_eq!(output.strategy, ScanStrategy::DensePincer);
+        assert!(output.stats.signature_requests > 2);
     }
 
     #[tokio::test]
@@ -2598,6 +2680,7 @@ mod tests {
                 scout_limit: 2,
                 full_limit: 2,
                 rpc_rps: None,
+                strategy_preference: StrategyPreference::Auto,
             },
         )
         .await

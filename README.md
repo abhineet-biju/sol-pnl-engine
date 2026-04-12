@@ -180,6 +180,7 @@ sol-balance-runtime [OPTIONS]
 | `--concurrency <N>` | 32 (or `rpc-rps` value if higher) | Maximum concurrent in-flight requests |
 | `--scout-limit <N>` | 1000 | Page size for signature discovery (1–1000) |
 | `--full-limit <N>` | 100 | Page size for full transaction fetches (1–100) |
+| `--strategy-preference <MODE>` | `auto` | Optional override for benchmarking (`auto`, `seeded-full-fanout`, `dense-pincer`, `dense-parallel-range`, `sparse-recursive`) |
 | `--output <PATH>` | `outputs/<address>.json` | Write JSON result to this file |
 
 ## Output format
@@ -261,7 +262,7 @@ The live client includes automatic retry and backoff:
 Live runs also report timing stats in the terminal:
 
 ```
-http attempts: 69 | retries: 0 | total http time: 113.42s | avg per attempt: 1.64s
+http attempts: 69 | retries: 0 | cumulative http time: 113.42s | avg per attempt: 1.64s
 first completed rpc attempt: 287ms (includes initial connection/TLS setup on a cold client)
 ```
 
