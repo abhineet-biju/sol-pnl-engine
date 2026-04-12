@@ -824,12 +824,13 @@ async fn validate_seeded_full_pagination(
     }
 
     let midpoint = left_frontier.slot + (right_frontier.slot - left_frontier.slot) / 2;
-    let page = get_full_page_unfiltered(
+    let page = get_full_page_with_filters(
         client,
         address,
         context,
         SortOrder::Asc,
         full_limit,
+        Some(Filters::slot_range(midpoint, right_frontier.slot)),
         Some(seeded_fanout_token(midpoint)),
     )
     .await?;
@@ -912,14 +913,19 @@ async fn fetch_seeded_segment_transactions(
     let mut pagination_token = Some(initial_token.clone());
     let mut records = Vec::new();
     let mut first_page = true;
+    let filters = Some(Filters::slot_range(
+        segment.start_slot,
+        seeded_segment_filter_end(&segment),
+    ));
 
     loop {
-        let page = get_full_page_unfiltered(
+        let page = get_full_page_with_filters(
             client,
             address,
             context.clone(),
             SortOrder::Asc,
             full_limit,
+            filters.clone(),
             pagination_token.take(),
         )
         .await?;
@@ -1015,6 +1021,17 @@ fn seeded_segment_reached_upper_boundary(
     }
 
     false
+}
+
+fn seeded_segment_filter_end(segment: &SeededFanoutSegment) -> u64 {
+    if let Some(end_slot) = segment.end_slot_exclusive {
+        return end_slot.saturating_sub(1).max(segment.start_slot);
+    }
+
+    segment
+        .upper_exclusive
+        .as_ref()
+        .map_or(u64::MAX, |record| record.slot)
 }
 
 fn should_use_parallel_dense_range_search(
