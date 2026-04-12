@@ -6,12 +6,16 @@ Built for [Mert's latency challenge](https://x.com/mert/status/20429414212970501
 
 > **Note:** If you're on a rate-limited Helius plan (Developer, Business, Professional), see [With rate limiting](#with-rate-limiting) before running.
 
+> **Latency default:** `--api-key` runs against Helius beta / Gatekeeper-style infrastructure by default for lower latency, and automatically falls back to the standard mainnet endpoint if beta is unavailable. Use `--rpc-url` if you want to force a specific endpoint.
+
 ```
 cargo run -- --api-key YOUR_KEY --address 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds
 ```
 
 ```
 scan complete
+source: live
+endpoint: helius beta
 address: 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds
 wall time: 14.56s
 entries: 6093 | signature requests: 8 | full requests: 61
@@ -61,6 +65,8 @@ Reads a local fixture file, simulates RPC paging and slot filtering, runs the fu
 ```bash
 cargo run -- --api-key YOUR_KEY --address YOUR_WALLET
 ```
+
+This uses `https://beta.helius-rpc.com/?api-key=...` by default and retries on the standard mainnet endpoint if beta fails.
 
 Or with a full RPC URL:
 

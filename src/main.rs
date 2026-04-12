@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use sol_balance_runtime::{
-    FixtureClient, HeliusClient, HeliusClientTimingStats, RuntimeScanConfig, TransactionsSource,
-    reconstruct_sol_balance_timeline,
+    FixtureClient, HeliusClient, HeliusClientTimingStats, RuntimeScanConfig, ScanError,
+    TransactionsSource, reconstruct_sol_balance_timeline,
 };
 
 #[derive(Debug, Parser)]
@@ -105,43 +105,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let scan_started_at = Instant::now();
-    let (scan_output, live_timing_stats, source_kind) = match (rpc_url, api_key, fixture) {
-        (Some(rpc_url), None, None) => {
-            let address = address.ok_or("`--address` is required with `--rpc-url`")?;
-            emit_helius_address_warning(&address);
-            let client = HeliusClient::new_with_rps(rpc_url, effective_rpc_rps)?;
-            let output = run_source(&client, &address, config.clone()).await?;
-            (output, Some(client.timing_stats()), "live")
-        }
-        (None, Some(api_key), None) => {
-            let address = address.ok_or("`--address` is required with `--api-key`")?;
-            emit_helius_address_warning(&address);
-            let client = HeliusClient::new_with_rps(
-                build_default_helius_rpc_url(&api_key),
-                effective_rpc_rps,
-            )?;
-            let output = run_source(&client, &address, config.clone()).await?;
-            (output, Some(client.timing_stats()), "live")
-        }
-        (None, None, Some(fixture_path)) => {
-            let client = FixtureClient::from_path(fixture_path)?;
-            let address = match address {
-                Some(address) => address,
-                None => client
-                    .address()
-                    .map(str::to_owned)
-                    .ok_or("`--address` is required unless the fixture file contains one")?,
-            };
-            emit_helius_address_warning(&address);
-            let output = run_source(&client, &address, config.clone()).await?;
-            (output, None, "fixture")
-        }
-        _ => {
-            return Err(
-                "choose exactly one input source: `--rpc-url`, `--api-key`, or `--fixture`".into(),
-            );
-        }
-    };
+    let (scan_output, live_timing_stats, source_kind, endpoint_kind) =
+        match (rpc_url, api_key, fixture) {
+            (Some(rpc_url), None, None) => {
+                let address = address.ok_or("`--address` is required with `--rpc-url`")?;
+                emit_helius_address_warning(&address);
+                let client = HeliusClient::new_with_rps(rpc_url, effective_rpc_rps)?;
+                let output = run_source(&client, &address, config.clone()).await?;
+                (
+                    output,
+                    Some(client.timing_stats()),
+                    "live",
+                    Some("custom rpc url"),
+                )
+            }
+            (None, Some(api_key), None) => {
+                let address = address.ok_or("`--address` is required with `--api-key`")?;
+                emit_helius_address_warning(&address);
+                let beta_client = HeliusClient::new_with_rps(
+                    build_default_helius_rpc_url(&api_key),
+                    effective_rpc_rps,
+                )?;
+
+                match run_source(&beta_client, &address, config.clone()).await {
+                    Ok(output) => (
+                        output,
+                        Some(beta_client.timing_stats()),
+                        "live",
+                        Some("helius beta"),
+                    ),
+                    Err(ScanError::Client(error)) => {
+                        eprintln!(
+                            "warning: beta endpoint failed ({error}); retrying on Helius mainnet"
+                        );
+
+                        let mainnet_client = HeliusClient::new_with_rps(
+                            build_mainnet_helius_rpc_url(&api_key),
+                            effective_rpc_rps,
+                        )?;
+                        let output = run_source(&mainnet_client, &address, config.clone()).await?;
+                        (
+                            output,
+                            Some(mainnet_client.timing_stats()),
+                            "live",
+                            Some("helius mainnet fallback"),
+                        )
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            (None, None, Some(fixture_path)) => {
+                let client = FixtureClient::from_path(fixture_path)?;
+                let address = match address {
+                    Some(address) => address,
+                    None => client
+                        .address()
+                        .map(str::to_owned)
+                        .ok_or("`--address` is required unless the fixture file contains one")?,
+                };
+                emit_helius_address_warning(&address);
+                let output = run_source(&client, &address, config.clone()).await?;
+                (output, None, "fixture", None)
+            }
+            _ => {
+                return Err(
+                    "choose exactly one input source: `--rpc-url`, `--api-key`, or `--fixture`"
+                        .into(),
+                );
+            }
+        };
     let scan_elapsed = scan_started_at.elapsed();
 
     let rendered = serde_json::to_string_pretty(&scan_output)?;
@@ -153,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &output_path,
         scan_elapsed,
         source_kind,
+        endpoint_kind,
         config,
         effective_rpc_rps,
         live_timing_stats,
@@ -174,12 +207,16 @@ fn emit_scan_summary(
     output_path: &Path,
     elapsed: Duration,
     source_kind: &str,
+    endpoint_kind: Option<&str>,
     config: RuntimeScanConfig,
     effective_rpc_rps: Option<u32>,
     live_timing_stats: Option<HeliusClientTimingStats>,
 ) {
     eprintln!("scan complete");
     eprintln!("source: {source_kind}");
+    if let Some(endpoint_kind) = endpoint_kind {
+        eprintln!("endpoint: {endpoint_kind}");
+    }
     eprintln!("address: {}", output.address);
     eprintln!("output: {}", output_path.display());
     eprintln!("wall time: {}", format_duration(elapsed));
@@ -231,6 +268,14 @@ fn format_millis(millis: f64) -> String {
 }
 
 fn build_default_helius_rpc_url(api_key: &str) -> String {
+    build_beta_helius_rpc_url(api_key)
+}
+
+fn build_beta_helius_rpc_url(api_key: &str) -> String {
+    format!("https://beta.helius-rpc.com/?api-key={api_key}")
+}
+
+fn build_mainnet_helius_rpc_url(api_key: &str) -> String {
     format!("https://mainnet.helius-rpc.com/?api-key={api_key}")
 }
 
@@ -352,14 +397,30 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        DEFAULT_CONCURRENCY, HeliusPlan, build_default_helius_rpc_url, default_output_path,
-        resolve_concurrency, resolve_rpc_rps,
+        DEFAULT_CONCURRENCY, HeliusPlan, build_beta_helius_rpc_url, build_default_helius_rpc_url,
+        build_mainnet_helius_rpc_url, default_output_path, resolve_concurrency, resolve_rpc_rps,
     };
 
     #[test]
-    fn build_default_helius_rpc_url_uses_mainnet_endpoint() {
+    fn build_default_helius_rpc_url_prefers_beta_endpoint() {
         assert_eq!(
             build_default_helius_rpc_url("test-key"),
+            "https://beta.helius-rpc.com/?api-key=test-key"
+        );
+    }
+
+    #[test]
+    fn build_beta_helius_rpc_url_uses_beta_endpoint() {
+        assert_eq!(
+            build_beta_helius_rpc_url("test-key"),
+            "https://beta.helius-rpc.com/?api-key=test-key"
+        );
+    }
+
+    #[test]
+    fn build_mainnet_helius_rpc_url_uses_mainnet_endpoint() {
+        assert_eq!(
+            build_mainnet_helius_rpc_url("test-key"),
             "https://mainnet.helius-rpc.com/?api-key=test-key"
         );
     }
