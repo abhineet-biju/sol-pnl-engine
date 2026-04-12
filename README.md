@@ -1,206 +1,189 @@
-# sol-balance-runtime
+# sol-pnl-engine
 
-`sol-balance-runtime` is a Rust CLI and library for reconstructing a Solana address's native SOL balance over time using Helius `getTransactionsForAddress`.
+Reconstructs a Solana wallet's **native SOL balance over time** using only Helius [`getTransactionsForAddress`](https://docs.helius.dev/solana-rpc-nodes/enhanced-methods/getTransactionsForAddress). No indexing, no database, just RPC.
 
-This project was built around a latency-focused challenge:
+Built for [Mert's latency challenge](https://x.com/mert/status/2042941421297050109?s=20): lowest average latency for SOL balance reconstruction across busy, sparse, and periodic wallets.
 
-- compute SOL balance over time at runtime
-- do not rely on a pre-indexed database
-- use RPC only
-- optimize for low average latency across different wallet shapes
+> **Note:** If you're on a rate-limited Helius plan (Developer, Business, Professional), see [With rate limiting](#with-rate-limiting) before running.
 
-In this repo, "SOL PnL" is interpreted the way mert clarified it: native `SOL balance over time`, not USD value, not token PnL, and not portfolio valuation.
-
-## What this project does
-
-Given a Solana address, the scanner:
-
-1. classifies the address with parallel ascending and descending `signatures` boundary queries
-2. chooses between a bidirectional pincer sweep for dense histories and recursive sparse-gap search
-3. fetches the required full transactions in bounded batches
-4. sorts the final history by `slot` and `transactionIndex`
-5. reconstructs the address's native SOL balance changes from `preBalances` and `postBalances`
-
-The output is a transaction-level timeline that can be used for benchmarking, correctness checks, or downstream analytics.
-
-## Why there is an offline replay mode
-
-Helius `getTransactionsForAddress` is not available on the free plan, so burning live requests while iterating on the algorithm is wasteful.
-
-To make development practical, this repo supports two interchangeable sources:
-
-- live Helius RPC
-- local fixture replay
-
-Both go through the same scanning algorithm. That means you can tune search heuristics, test paging behavior, and validate timeline reconstruction locally before touching a paid Helius endpoint.
-
-## Current status
-
-This repo currently contains:
-
-- a working Rust CLI
-- a reusable library API
-- a live Helius client
-- a fixture-backed offline client
-- a hybrid latency strategy that combines boundary sweeps, recursive sparse search, and dense-slot pincer pagination
-- warnings for Helius-documented special-case addresses
-- unit tests for ordering, job packing, small-wallet fast paths, sparse recursion, dense-wallet boundary sweeps, dense-slot pagination, loaded address handling, and offline end-to-end replay
-
-This is now a strong submission candidate. The remaining external step is live benchmarking across representative wallets once paid Helius access is available.
-
-## Repository layout
-
-```text
-.
-|-- Cargo.toml
-|-- README.md
-|-- fixtures/
-|   `-- sample_wallet.json
-`-- src/
-    |-- algorithm.rs
-    |-- client.rs
-    |-- lib.rs
-    |-- main.rs
-    `-- model.rs
+```
+cargo run -- --api-key YOUR_KEY --address 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds
 ```
 
-What each file is for:
+```
+scan complete
+address: 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds
+wall time: 14.56s
+entries: 6093 | signature requests: 8 | full requests: 61
+concurrency: 32 | rpc pacing: unbounded
+```
 
-- `src/main.rs`: CLI entrypoint
-- `src/algorithm.rs`: adaptive scan logic and SOL balance reconstruction
-- `src/client.rs`: live Helius client plus fixture replay client
-- `src/model.rs`: request and response models
-- `src/lib.rs`: public library exports
-- `fixtures/sample_wallet.json`: small offline example fixture
+6,093 transactions discovered in **8 signature requests**, full history reconstructed in **14.56s**.
 
-## Requirements
+## Why it's fast
 
-- Rust toolchain with `cargo`
-- for live mode only: a Helius RPC URL with access to `getTransactionsForAddress`
+The algorithm exploits `getTransactionsForAddress`'s bidirectional sorting and slot-range filtering to parallelize everything it can.
 
-The offline replay path does not require network access or a Helius key.
+| Wallet type | What happens | Signature requests |
+|---|---|---|
+| Small (<=1000 txs) | Two parallel boundary probes cover the entire history | **2** |
+| Dense (thousands of txs) | Bidirectional pincer sweep from both ends, meeting in the middle | **~2 per 1000 txs** |
+| Sparse (gaps between activity) | Recursive binary search over slot ranges with adaptive subrange splitting | **varies, but parallelized** |
+
+**Key optimizations:**
+
+- **Pipelined fetching**: for dense wallets, full-transaction fetches fire as soon as each signature page arrives, overlapping discovery and data retrieval. Phases 2 and 3 run concurrently, not sequentially.
+- **Signatures-first discovery**: uses `transactionDetails: signatures` (lightweight) to map the history before requesting full transactions (heavy). This minimizes bandwidth and response times during the search phase.
+- **Adaptive subrange planning**: for sparse wallets, the first page's density is used to estimate optimal slot-range windows. Up to 16 subranges are searched in parallel instead of walking the ledger sequentially.
+- **Probe-and-narrow**: when splitting ranges, the algorithm sends single-record probes (`limit=1`) to find the tightest bounding slots on each side before recursing, avoiding wasted requests on empty ranges.
+- **Concurrency-controlled**: all RPC calls go through a shared semaphore (default 32 permits), bounding in-flight requests without serializing independent work.
+
+A naive sequential approach for the 6,093-transaction example above would take ~7 signature pages + ~61 full pages = 68 requests done one at a time. At 1.64s average HTTP time per request, that's **~112s sequential vs 14.56s actual, roughly 8x faster**.
 
 ## Quick start
 
-### 1. Clone and test
+### Run tests (no API key needed)
 
 ```bash
 cargo test
 ```
 
-### 2. Run in offline replay mode
-
-This is the recommended first run.
+### Run in offline replay mode (no API key needed)
 
 ```bash
 cargo run -- --fixture fixtures/sample_wallet.json
 ```
 
-Expected behavior:
+Reads a local fixture file, simulates RPC paging and slot filtering, runs the full algorithm, and writes results to `outputs/<address>.json`.
 
-- reads the fixture file
-- simulates `getTransactionsForAddress` paging and slot filtering locally
-- runs the full scanner
-- writes the result to `outputs/<address>.json`
-- prints a short scan summary in the terminal with wall time and output location
-
-### 3. Run against live Helius RPC
-
-If you have a paid Helius plan that supports `getTransactionsForAddress`:
-
-The simplest option is to pass the API key directly:
+### Run against live Helius RPC
 
 ```bash
-cargo run -- \
-  --api-key "YOUR_API_KEY" \
-  --address "YOUR_WALLET_ADDRESS"
+cargo run -- --api-key YOUR_KEY --address YOUR_WALLET
 ```
 
-You can also pass the full RPC URL:
+Or with a full RPC URL:
 
 ```bash
-cargo run -- \
-  --rpc-url "https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY" \
-  --address "YOUR_WALLET_ADDRESS"
+cargo run -- --rpc-url "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY" --address YOUR_WALLET
 ```
 
-You can also set the RPC URL through an environment variable:
+Both `--api-key` and `--rpc-url` can also be set via environment variables (`HELIUS_API_KEY` and `HELIUS_RPC_URL` respectively).
+
+### With rate limiting
+
+If your Helius plan has a request cap, use `--plan` to set automatic pacing:
 
 ```bash
-export HELIUS_RPC_URL="https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY"
-
-cargo run -- \
-  --address "YOUR_WALLET_ADDRESS"
+cargo run -- --api-key YOUR_KEY --address YOUR_WALLET --plan developer
 ```
 
-Or set just the API key:
+| Plan | Requests/sec |
+|---|---|
+| `developer` | 50 |
+| `business` | 200 |
+| `professional` | 500 |
+| `enterprise` | unbounded |
+
+Or set an explicit cap with `--rpc-rps`:
 
 ```bash
-export HELIUS_API_KEY="YOUR_API_KEY"
-
-cargo run -- \
-  --address "YOUR_WALLET_ADDRESS"
+cargo run -- --api-key YOUR_KEY --address YOUR_WALLET --rpc-rps 100
 ```
+
+`--rpc-rps` overrides `--plan` if both are provided.
+
+## How the algorithm works
+
+### Phase 1: classify the history (2 parallel requests)
+
+Two requests fire simultaneously:
+
+- oldest page: `sortOrder = asc, limit = scoutLimit` (default 1000)
+- newest page: `sortOrder = desc, limit = scoutLimit`
+
+If the two pages overlap, the entire history is already known. **The small-wallet fast path completes signature discovery in exactly 2 requests.**
+
+If they don't overlap, the gap between the two frontiers determines whether the history looks dense or sparse.
+
+### Phase 2: discover all signatures
+
+**Dense path**: the two boundary pages didn't overlap, but the gap is compact relative to the covered span (gap < 8x the already-covered slot range). The scanner continues paginating from both ends simultaneously, letting the two cursors meet in the middle. As each signature page arrives, its corresponding full-transaction fetch jobs are **immediately dispatched**. Signature discovery and full-transaction fetching run concurrently.
+
+**Sparse path**: the gap is large relative to the covered span. The scanner recursively splits the remaining slot range and searches each subrange in parallel. Before recursing, it sends 1-record probes to find the tightest bounding slots on each side, avoiding wasted requests on empty gaps. An adaptive subrange planner uses observed density to estimate optimal window sizes, capped at 16 parallel subranges.
+
+**Dense single-slot**: when a single slot contains more signatures than the page size, the scanner paginates that slot bidirectionally from both ends instead of walking one side linearly.
+
+### Phase 3: fetch full transactions
+
+Discovered signatures are grouped into bounded full-fetch jobs (max `fullLimit` transactions per page, default 100). Each job specifies a slot range and expected count. Jobs run concurrently, controlled by the concurrency semaphore.
+
+For the dense path, this phase is pipelined with Phase 2. Jobs are already in-flight by the time discovery finishes.
+
+### Phase 4: reconstruct SOL balance over time
+
+For each full transaction:
+
+1. Find the target address in `accountKeys` (including `loadedAddresses` for versioned transactions)
+2. Read `preBalances[i]` and `postBalances[i]` at the target's index
+3. Compute `delta = post - pre`
+
+The final timeline is sorted by `(slot, transactionIndex, signature)`. Failed transactions are included because fees still reduce SOL balance.
+
+### Algorithm tuning constants
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `DENSITY_SAFETY_FACTOR` | 1.5 | Inflates estimated slot windows to avoid underfetching |
+| `MAX_ADAPTIVE_WINDOWS` | 16 | Maximum parallel subranges in the adaptive planner |
+| `SPARSE_GAP_MULTIPLIER` | 8 | Gap must exceed 8x covered span to trigger sparse-path recursion |
 
 ## CLI reference
 
-```text
-sol-balance-runtime
-  --rpc-url <URL>          Live Helius RPC endpoint
-  --api-key <KEY>          Helius API key; builds the default mainnet RPC URL
-  --fixture <PATH>         Local fixture file for offline replay
-  --address <ADDRESS>      Target wallet/address
-  --output <PATH>          Write the JSON result to this file
-  --plan <PLAN>            Optional Helius plan preset for pacing
-  --rpc-rps <N>            Optional request-per-second cap
-  --concurrency <N>        Max in-flight requests/jobs
-  --scout-limit <N>        Page size for signature discovery, default 1000
-  --full-limit <N>         Page size for full transactions, default 100
+```
+sol-pnl-engine [OPTIONS]
 ```
 
-Notes:
+### Input source (pick exactly one)
 
-- choose exactly one of `--rpc-url`, `--api-key`, or `--fixture`
-- if the fixture file contains an `address`, `--address` can be omitted
-- if `--output` is omitted, the CLI writes to `outputs/<address>.json`
-- the JSON output is always written to a file and is always pretty-printed
-- the terminal only shows a short summary so large scans do not flood your screen
-- live runs also print request timing stats, including the first completed RPC attempt as a cold-start proxy for initial connection/TLS setup
-- `--rpc-rps` overrides `--plan` if both are provided
-- current built-in plan presets are `developer=50 rps`, `business=200 rps`, `professional=500 rps`, and `enterprise=uncapped/custom`
-- if `--concurrency` is omitted, the CLI defaults to `32`, or to the configured request cap when using `--plan` / `--rpc-rps`
-- `--scout-limit` is clamped to `1..=1000`
-- `--full-limit` is clamped to `1..=100`
+| Flag | Env var | Description |
+|---|---|---|
+| `--rpc-url <URL>` | `HELIUS_RPC_URL` | Live Helius RPC endpoint |
+| `--api-key <KEY>` | `HELIUS_API_KEY` | Helius API key (builds default mainnet URL) |
+| `--fixture <PATH>` | - | Local fixture file for offline replay |
 
-Example terminal summary:
+### Required with live sources
 
-```text
-scan complete
-source: live
-address: 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds
-output: outputs/2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds.json
-wall time: 14.56s
-entries: 6093 | signature requests: 8 | full requests: 61
-concurrency: 32 | rpc pacing: unbounded
-http attempts: 69 | retries: 0 | total http time: 113.42s | avg per attempt: 1.64s
-first completed rpc attempt: 287ms (includes initial connection/TLS setup on a cold client)
-```
+| Flag | Description |
+|---|---|
+| `--address <ADDRESS>` | Target Solana address. Optional with `--fixture` if the fixture contains an `address` field. |
 
-## Example output
+### Tuning
 
-The JSON file written by the CLI has this high-level shape:
+| Flag | Default | Description |
+|---|---|---|
+| `--plan <PLAN>` | - | Helius plan preset for automatic request pacing |
+| `--rpc-rps <N>` | unbounded | Explicit requests-per-second cap (overrides `--plan`) |
+| `--concurrency <N>` | 32 (or `rpc-rps` value if higher) | Maximum concurrent in-flight requests |
+| `--scout-limit <N>` | 1000 | Page size for signature discovery (1–1000) |
+| `--full-limit <N>` | 100 | Page size for full transaction fetches (1–100) |
+| `--output <PATH>` | `outputs/<address>.json` | Write JSON result to this file |
+
+## Output format
+
+The JSON output written to file:
 
 ```json
 {
-  "address": "target",
+  "address": "2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds",
   "initial_balance_lamports": 0,
   "final_balance_lamports": 899990000,
   "entries": [
     {
-      "signature": "sig-10-0",
-      "slot": 10,
+      "signature": "5abc...",
+      "slot": 28429130,
       "transaction_index": 0,
-      "block_time": 10,
+      "block_time": 1700000000,
       "succeeded": true,
       "pre_balance_lamports": 0,
       "post_balance_lamports": 1000000000,
@@ -208,105 +191,58 @@ The JSON file written by the CLI has this high-level shape:
     }
   ],
   "stats": {
-    "signature_requests": 2,
-    "full_requests": 1,
-    "discovered_signatures": 4,
-    "fetched_transactions": 4,
-    "fetch_jobs": 1,
+    "signature_requests": 8,
+    "full_requests": 61,
+    "discovered_signatures": 6093,
+    "fetched_transactions": 6093,
+    "fetch_jobs": 61,
     "max_discovery_depth": 0
   }
 }
 ```
 
-### Output fields
+### Entry fields
 
-- `address`: the target address scanned
-- `initial_balance_lamports`: the earliest observed balance before the first transaction in the timeline
-- `final_balance_lamports`: the last observed balance after the final transaction in the timeline
-- `entries`: ordered transaction-level balance events
-- `stats`: a small summary of how much scanning work was done
+| Field | Description |
+|---|---|
+| `signature` | Transaction signature |
+| `slot` | Solana slot number |
+| `transaction_index` | Position within the block (zero-indexed) |
+| `block_time` | Unix timestamp (optional) |
+| `succeeded` | Whether the transaction succeeded |
+| `pre_balance_lamports` | Target address balance before the transaction |
+| `post_balance_lamports` | Target address balance after the transaction |
+| `delta_lamports` | `post - pre` |
 
-Each timeline entry includes:
+### Stats fields
 
-- `signature`: the transaction signature
-- `slot`: Solana slot
-- `transaction_index`: zero-based position inside the block
-- `block_time`: optional Unix timestamp
-- `succeeded`: whether the transaction succeeded
-- `pre_balance_lamports`: target address balance before the transaction
-- `post_balance_lamports`: target address balance after the transaction
-- `delta_lamports`: `post - pre`
+| Field | Description |
+|---|---|
+| `signature_requests` | Total signature-mode RPC requests made |
+| `full_requests` | Total full-transaction RPC requests made |
+| `discovered_signatures` | Unique signatures discovered during search |
+| `fetched_transactions` | Transactions in the final timeline |
+| `fetch_jobs` | Full-fetch job batches created |
+| `max_discovery_depth` | Deepest recursion level reached during sparse search (0 = no recursion needed) |
 
-## How the algorithm works
+## HTTP resilience
 
-The scanner is designed around the key advantage of Helius `getTransactionsForAddress`: it can sort both ascending and descending, and it supports slot-range filters.
+The live client includes automatic retry and backoff:
 
-### Phase 1: classify the history quickly
+- **3 retries** on 429 (Too Many Requests), 5xx server errors, timeouts, and connection failures
+- **Exponential backoff**: 150ms, 300ms, 600ms (150ms * 2^attempt)
+- **HTTP timeouts**: 10s connect, 30s request, 90s connection pool idle
 
-The scanner asks for:
+Live runs also report timing stats in the terminal:
 
-- the oldest page with `sortOrder = asc, limit = scoutLimit`
-- the newest page with `sortOrder = desc, limit = scoutLimit`
-
-That gives:
-
-- the oldest and newest observed transactions
-- an immediate fast path for small wallets when the two pages already cover the full history
-- a cheap signal for whether the remaining work looks dense or sparse
-
-### Phase 2: discover signatures cheaply
-
-The scanner uses `transactionDetails = signatures` first because it is cheaper and lighter than fetching full transactions immediately.
-
-For dense histories, the scanner continues from both ends in parallel and lets the two sides meet in the middle.
-
-For sparse histories, the scanner recursively searches slot ranges and uses adaptive subrange planning so it does not behave like a purely sequential ledger walk.
-
-For dense single-slot histories, the scanner paginates that slot from both directions instead of walking only one side.
-
-This is the core latency-oriented search step.
-
-### Phase 3: convert signatures into full-fetch jobs
-
-Once the signature set is known, the scanner groups signatures by slot and creates bounded jobs for full transaction fetches.
-
-The job packing rules are:
-
-- pack adjacent slots together while total expected transaction count stays within the full fetch limit
-- isolate dense single slots when one slot alone exceeds the limit
-
-### Phase 4: reconstruct SOL balance over time
-
-For each full transaction, the scanner:
-
-- finds the target address in the transaction account list
-- includes loaded lookup-table addresses when present
-- reads the target index from `preBalances` and `postBalances`
-- computes `delta_lamports = post - pre`
-
-The final timeline is sorted by:
-
-1. `slot`
-2. `transactionIndex`
-3. signature tie-breaker
-
-That ordering matters. `blockTime` alone is not precise enough.
-
-## Important assumptions
-
-This project currently assumes:
-
-- the target output is a transaction-level native SOL balance timeline
-- failed transactions are still relevant because fees can reduce SOL balance
-- versioned transactions must be included, so full fetches request `maxSupportedTransactionVersion = 0`
-- requests should explicitly use `status = any` and `tokenAccounts = none`
-- the target is usually a wallet-like address, not a special program account
-
-These assumptions match the challenge framing reasonably well, but they are still assumptions. If your judging environment differs, adjust accordingly.
+```
+http attempts: 69 | retries: 0 | total http time: 113.42s | avg per attempt: 1.64s
+first completed rpc attempt: 287ms (includes initial connection/TLS setup on a cold client)
+```
 
 ## Fixture format
 
-Offline replay uses a JSON file with this shape:
+For offline replay, provide a JSON file with full transactions:
 
 ```json
 {
@@ -333,109 +269,45 @@ Offline replay uses a JSON file with this shape:
 }
 ```
 
-### Fixture notes
+- `address` is optional (can be passed via `--address` instead)
+- Transactions do not need to be pre-sorted; the fixture client sorts and deduplicates on load
+- Include `loadedAddresses` when replaying versioned transactions that reference the target via lookup tables
+- Signature-mode pages are derived automatically from the full transactions
 
-- `address` is optional but recommended
-- `transactions` should already represent the full transactions relevant to the address
-- `transactionIndex` and `slot` are important for correct ordering
-- `loadedAddresses` should be included when replaying versioned transactions that reference the target via lookup tables
-- the fixture client derives signature-mode pages from the full transactions automatically
+## Special address handling
 
-## Development workflow
+Some Solana addresses are documented by Helius as having degraded performance or limited indexing. The CLI warns when scanning these:
 
-### Run tests
+| Category | Example | Behavior |
+|---|---|---|
+| Routed to old archival | `Stake11111111111111111111111111111111111111` | Higher latency, different behavior |
+| Slot-scan fallback (not indexed) | `11111111111111111111111111111111` | Much worse performance |
+| Reserved/unindexed | `SysvarC1ock11111111111111111111111111111111` | May return empty results |
+
+## Project structure
+
+```
+src/
+  algorithm.rs    Adaptive scan logic and SOL balance reconstruction
+  client.rs       Live Helius client + fixture replay client
+  model.rs        RPC request/response types
+  main.rs         CLI entrypoint
+  lib.rs          Public library exports
+fixtures/
+  sample_wallet.json   Small offline example
+```
+
+## Development
 
 ```bash
-cargo test
+cargo test                                              # run tests
+cargo clippy --all-targets --all-features -- -D warnings # lints
+cargo fmt                                                # format
+cargo run -- --fixture fixtures/sample_wallet.json       # offline replay
 ```
 
-### Run lints
+## Requirements
 
-```bash
-cargo clippy --all-targets --all-features -- -D warnings
-```
-
-### Format code
-
-```bash
-cargo fmt
-```
-
-### Run the sample fixture
-
-```bash
-cargo run -- --fixture fixtures/sample_wallet.json --pretty
-```
-
-## Library usage
-
-The library API is exposed from `src/lib.rs`.
-
-The main entrypoint is:
-
-```rust
-reconstruct_sol_balance_timeline(source, address, config).await
-```
-
-Where:
-
-- `source` implements `TransactionsSource`
-- `address` is the target address
-- `config` is `RuntimeScanConfig`
-
-This makes it straightforward to:
-
-- plug in live Helius RPC
-- plug in offline fixtures
-- add benchmarking or custom replay sources later
-
-## Limitations
-
-This baseline intentionally does not solve everything yet.
-
-Known limitations:
-
-- no automatic fixture capture from live RPC yet
-- no benchmark harness for comparing heuristics across many wallets yet
-- no custom heuristics for highly pathological account types
-- no persistent memoization or warm cache layer
-- no scoring framework for challenge submissions yet
-
-There are also external limitations inherited from the upstream method:
-
-- `getTransactionsForAddress` is Helius-specific
-- it is not available on Helius free plan
-- pricing and plan availability can change, so check current Helius docs before relying on a specific cost model
-- some addresses are explicitly documented by Helius as routed to old archival, slot-scan fallback, or reserved/unindexed; the CLI now warns when the target address matches one of those known cases
-
-## Why Rust
-
-Rust was chosen because this problem is mostly about request strategy and concurrency discipline.
-
-Rust gives this project:
-
-- low runtime overhead
-- strong async/concurrency control
-- predictable performance
-- clear separation between algorithm, transport, and replay
-
-Bun or Node would also be viable, but Rust is a better fit for a latency-sensitive benchmark tool where we want the client overhead to stay out of the way.
-
-## Roadmap
-
-The most useful next steps are:
-
-1. add live-to-fixture capture so a single paid run can be replayed locally forever
-2. add a benchmark harness for busy, sparse, and periodic wallet archetypes
-3. experiment with smarter range-splitting and stopping heuristics
-4. compare cold-start latency distributions, not just mean latency
-5. add correctness fixtures based on real wallet histories
-
-## References
-
-- Helius docs: `getTransactionsForAddress`
-- Helius API reference: `getTransactionsForAddress`
-- Solana RPC docs: `getTransaction`
-- Solana RPC JSON structures
-
-If you are landing here for the first time, start with fixture mode, confirm you understand the output shape, and only then move to live Helius runs.
+- Rust toolchain with `cargo`
+- For live mode: a Helius plan with access to `getTransactionsForAddress`
+- Offline replay requires no network access or API key
