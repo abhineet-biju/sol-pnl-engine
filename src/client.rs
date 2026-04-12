@@ -337,9 +337,11 @@ impl FixtureClient {
 
         build_page(
             records,
+            config.sort_order,
             config.limit,
             config.pagination_token,
             signature_token,
+            signature_key,
         )
     }
 
@@ -361,9 +363,11 @@ impl FixtureClient {
 
         build_page(
             records,
+            config.sort_order,
             config.limit,
             config.pagination_token,
             full_transaction_token,
+            full_transaction_key,
         )
     }
 }
@@ -437,8 +441,16 @@ fn signature_token(record: &SignatureRecord) -> String {
     format!("{}:{}", record.slot, record.transaction_index)
 }
 
+fn signature_key(record: &SignatureRecord) -> (u64, u32) {
+    (record.slot, record.transaction_index)
+}
+
 fn full_transaction_token(record: &FullTransactionRecord) -> String {
     format!("{}:{}", record.slot, record.transaction_index)
+}
+
+fn full_transaction_key(record: &FullTransactionRecord) -> (u64, u32) {
+    (record.slot, record.transaction_index)
 }
 
 fn matches_slot_filter(slot: u64, filters: Option<&Filters>) -> bool {
@@ -505,9 +517,11 @@ fn full_record_order_asc(
 
 fn build_page<T, F>(
     records: Vec<T>,
+    sort_order: SortOrder,
     limit: usize,
     pagination_token: Option<String>,
     token_for: F,
+    key_for: fn(&T) -> (u64, u32),
 ) -> Result<GtfaPage<T>, HeliusClientError>
 where
     T: Clone,
@@ -515,10 +529,18 @@ where
 {
     let start = match pagination_token {
         Some(token) => {
-            let Some(index) = records.iter().position(|record| token_for(record) == token) else {
-                return Err(HeliusClientError::InvalidPaginationToken { token });
-            };
-            index + 1
+            if let Some(index) = records.iter().position(|record| token_for(record) == token) {
+                index + 1
+            } else {
+                let token_key = parse_token_key(&token)?;
+                records
+                    .iter()
+                    .position(|record| match sort_order {
+                        SortOrder::Asc => key_for(record) > token_key,
+                        SortOrder::Desc => key_for(record) < token_key,
+                    })
+                    .unwrap_or(records.len())
+            }
         }
         None => 0,
     };
@@ -541,4 +563,26 @@ where
         data,
         pagination_token,
     })
+}
+
+fn parse_token_key(token: &str) -> Result<(u64, u32), HeliusClientError> {
+    let Some((slot, transaction_index)) = token.split_once(':') else {
+        return Err(HeliusClientError::InvalidPaginationToken {
+            token: token.to_owned(),
+        });
+    };
+
+    let slot = slot
+        .parse()
+        .map_err(|_| HeliusClientError::InvalidPaginationToken {
+            token: token.to_owned(),
+        })?;
+    let transaction_index =
+        transaction_index
+            .parse()
+            .map_err(|_| HeliusClientError::InvalidPaginationToken {
+                token: token.to_owned(),
+            })?;
+
+    Ok((slot, transaction_index))
 }

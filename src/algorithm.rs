@@ -36,6 +36,13 @@ const PARALLEL_DENSE_MIN_CONCURRENCY: usize = 32;
 const PARALLEL_DENSE_MIN_ESTIMATED_SIGNATURES_MULTIPLIER: usize = 8;
 const PARALLEL_DENSE_MIN_RPS: u32 = 200;
 const PARALLEL_DENSE_MIN_WAVE_ADVANTAGE: usize = 4;
+const SEEDED_FANOUT_MIN_CONCURRENCY: usize = 32;
+const SEEDED_FANOUT_MIN_ESTIMATED_SIGNATURES_MULTIPLIER: usize = 16;
+const SEEDED_FANOUT_MIN_RPS: u32 = 200;
+const SEEDED_FANOUT_MIN_SLOT_SPAN_MULTIPLIER: u64 = 8;
+const SEEDED_FANOUT_MAX_SEGMENTS: usize = 32;
+const SEEDED_FANOUT_TARGET_PAGES_PER_SEGMENT: usize = 6;
+const SEEDED_FANOUT_VALIDATION_TOLERANCE_DIVISOR: u64 = 8;
 const SPARSE_CONFIRMATION_MIN_SAMPLE_SIZE: usize = 256;
 const SPARSE_CONFIRMATION_SHRINK_FACTOR: u64 = 4;
 
@@ -55,6 +62,12 @@ struct FullFetchJob {
 }
 
 struct DensePipelineResult {
+    signatures: Vec<SignatureRecord>,
+    full_transactions: Vec<FullTransactionRecord>,
+    fetch_jobs: usize,
+}
+
+struct SeededFanoutResult {
     signatures: Vec<SignatureRecord>,
     full_transactions: Vec<FullTransactionRecord>,
     fetch_jobs: usize,
@@ -249,6 +262,7 @@ pub async fn reconstruct_sol_balance_timeline(
     let history_fits_boundary_pages = pages_cover_complete_history(&oldest_page, &newest_page);
     let mut prefetched_full_transactions = None;
     let mut prefetched_fetch_jobs = None;
+    let mut prefetched_signatures = None;
 
     let mut signatures = if history_fits_boundary_pages {
         let mut signatures = oldest_page.data.clone();
@@ -266,7 +280,38 @@ pub async fn reconstruct_sol_balance_timeline(
             .cloned()
             .expect("non-empty boundary page");
 
-        let should_use_sparse_search = if should_use_sparse_gap_search(&oldest_page, &newest_page) {
+        let should_try_seeded_fanout = should_use_seeded_dense_full_fanout(
+            &config,
+            &oldest_page,
+            &newest_page,
+            signature_range,
+        );
+
+        if should_try_seeded_fanout {
+            match try_seeded_dense_full_fanout(
+                client,
+                address,
+                context.clone(),
+                &config,
+                full_limit,
+                &oldest_page,
+                &newest_page,
+                signature_range,
+            )
+            .await?
+            {
+                Some(seeded_result) => {
+                    prefetched_fetch_jobs = Some(seeded_result.fetch_jobs);
+                    prefetched_full_transactions = Some(seeded_result.full_transactions);
+                    prefetched_signatures = Some(seeded_result.signatures);
+                }
+                None => {}
+            }
+        }
+
+        let should_use_sparse_search = if prefetched_full_transactions.is_some() {
+            false
+        } else if should_use_sparse_gap_search(&oldest_page, &newest_page) {
             if should_confirm_sparse_gap_classification(
                 &config,
                 &oldest_page,
@@ -288,7 +333,9 @@ pub async fn reconstruct_sol_balance_timeline(
             false
         };
 
-        if should_use_sparse_search {
+        if prefetched_full_transactions.is_some() {
+            prefetched_signatures.take().unwrap_or_default()
+        } else if should_use_sparse_search {
             let mut signatures = oldest_page.data.clone();
             signatures.extend(newest_page.data.clone());
             discover_signatures_in_range(
@@ -532,6 +579,404 @@ async fn confirm_sparse_gap_search(
     let narrowed_gap = right_midpoint_slot.saturating_sub(left_midpoint_slot);
 
     Ok(narrowed_gap > original_gap / SPARSE_CONFIRMATION_SHRINK_FACTOR)
+}
+
+fn should_use_seeded_dense_full_fanout(
+    config: &RuntimeScanConfig,
+    asc_page: &GtfaPage<SignatureRecord>,
+    desc_page: &GtfaPage<SignatureRecord>,
+    range: SlotRange,
+) -> bool {
+    if config.concurrency < SEEDED_FANOUT_MIN_CONCURRENCY {
+        return false;
+    }
+
+    if let Some(rpc_rps) = config.rpc_rps
+        && rpc_rps < SEEDED_FANOUT_MIN_RPS
+    {
+        return false;
+    }
+
+    let scout_limit = config.scout_limit.max(1);
+    if asc_page.data.len() < scout_limit || desc_page.data.len() < scout_limit {
+        return false;
+    }
+
+    if range.span() < (scout_limit as u64).saturating_mul(SEEDED_FANOUT_MIN_SLOT_SPAN_MULTIPLIER) {
+        return false;
+    }
+
+    let Some(estimated_signatures) = estimate_dense_signature_count(asc_page, desc_page, range)
+    else {
+        return false;
+    };
+
+    if estimated_signatures
+        < scout_limit.saturating_mul(SEEDED_FANOUT_MIN_ESTIMATED_SIGNATURES_MULTIPLIER)
+    {
+        return false;
+    }
+
+    let pincer_rounds = estimated_signatures.div_ceil(scout_limit.saturating_mul(2));
+    pincer_rounds >= 8
+}
+
+async fn try_seeded_dense_full_fanout(
+    client: &(impl TransactionsSource + ?Sized),
+    address: &str,
+    context: ScanContext,
+    config: &RuntimeScanConfig,
+    full_limit: usize,
+    oldest_page: &GtfaPage<SignatureRecord>,
+    newest_page: &GtfaPage<SignatureRecord>,
+    signature_range: SlotRange,
+) -> Result<Option<SeededFanoutResult>, ScanError> {
+    let Some(estimated_signatures) =
+        estimate_dense_signature_count(oldest_page, newest_page, signature_range)
+    else {
+        return Ok(None);
+    };
+
+    let left_signature_frontier = oldest_page
+        .data
+        .last()
+        .cloned()
+        .expect("seeded dense fanout requires a left frontier");
+    let right_signature_frontier = newest_page
+        .data
+        .last()
+        .cloned()
+        .expect("seeded dense fanout requires a right frontier");
+
+    let validation_ok = match validate_seeded_full_pagination(
+        client,
+        address,
+        context.clone(),
+        full_limit,
+        &left_signature_frontier,
+        &right_signature_frontier,
+    )
+    .await
+    {
+        Ok(valid) => valid,
+        Err(ScanError::Client(_)) => false,
+        Err(error) => return Err(error),
+    };
+
+    if !validation_ok {
+        return Ok(None);
+    }
+
+    let (left_page, right_page) = tokio::join!(
+        get_full_page_unfiltered(
+            client,
+            address,
+            context.clone(),
+            SortOrder::Asc,
+            full_limit,
+            None,
+        ),
+        get_full_page_unfiltered(
+            client,
+            address,
+            context.clone(),
+            SortOrder::Desc,
+            full_limit,
+            None,
+        )
+    );
+
+    let left_page = match left_page {
+        Ok(page) => page,
+        Err(ScanError::Client(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let right_page = match right_page {
+        Ok(page) => page,
+        Err(ScanError::Client(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+
+    let Some(left_frontier) = left_page.data.last().cloned() else {
+        return Ok(None);
+    };
+    let Some(right_frontier) = right_page.data.last().cloned() else {
+        return Ok(None);
+    };
+
+    let mut signatures = left_page
+        .data
+        .iter()
+        .map(signature_record_from_full_transaction)
+        .collect::<Vec<_>>();
+    signatures.extend(
+        right_page
+            .data
+            .iter()
+            .map(signature_record_from_full_transaction),
+    );
+
+    let mut full_transactions = left_page.data.clone();
+    full_transactions.extend(right_page.data.clone());
+
+    if full_record_order(&left_frontier, &right_frontier) != Ordering::Less {
+        sort_and_dedup_signatures(&mut signatures);
+        sort_and_dedup_full_transactions(&mut full_transactions);
+        return Ok(Some(SeededFanoutResult {
+            signatures,
+            full_transactions,
+            fetch_jobs: 2,
+        }));
+    }
+
+    let segments = plan_seeded_fanout_segments(
+        config,
+        full_limit,
+        estimated_signatures,
+        &left_frontier,
+        &right_frontier,
+    );
+
+    let mut segment_futures = FuturesUnordered::new();
+    for segment in segments.clone() {
+        segment_futures.push(fetch_seeded_segment_transactions(
+            client,
+            address,
+            context.clone(),
+            full_limit,
+            segment,
+        ));
+    }
+
+    while let Some(result) = segment_futures.next().await {
+        match result {
+            Ok(segment_records) => {
+                signatures.extend(
+                    segment_records
+                        .iter()
+                        .map(signature_record_from_full_transaction),
+                );
+                full_transactions.extend(segment_records);
+            }
+            Err(ScanError::Client(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+
+    sort_and_dedup_signatures(&mut signatures);
+    sort_and_dedup_full_transactions(&mut full_transactions);
+
+    Ok(Some(SeededFanoutResult {
+        signatures,
+        full_transactions,
+        fetch_jobs: 2 + segments.len(),
+    }))
+}
+
+async fn validate_seeded_full_pagination(
+    client: &(impl TransactionsSource + ?Sized),
+    address: &str,
+    context: ScanContext,
+    full_limit: usize,
+    left_frontier: &SignatureRecord,
+    right_frontier: &SignatureRecord,
+) -> Result<bool, ScanError> {
+    if left_frontier.slot >= right_frontier.slot {
+        return Ok(false);
+    }
+
+    let midpoint = left_frontier.slot + (right_frontier.slot - left_frontier.slot) / 2;
+    let page = get_full_page_unfiltered(
+        client,
+        address,
+        context,
+        SortOrder::Asc,
+        full_limit,
+        Some(seeded_fanout_token(midpoint)),
+    )
+    .await?;
+
+    let Some(first_record) = page.data.first() else {
+        return Ok(false);
+    };
+
+    let span = right_frontier
+        .slot
+        .saturating_sub(left_frontier.slot)
+        .saturating_add(1);
+    let tolerance = (span / SEEDED_FANOUT_VALIDATION_TOLERANCE_DIVISOR).max(1);
+    let minimum_expected_slot = midpoint.saturating_sub(tolerance);
+
+    Ok(first_record.slot >= minimum_expected_slot && first_record.slot <= right_frontier.slot)
+}
+
+#[derive(Debug, Clone)]
+struct SeededFanoutSegment {
+    start_slot: u64,
+    end_slot_exclusive: Option<u64>,
+    lower_exclusive: Option<SignatureRecord>,
+    upper_exclusive: Option<SignatureRecord>,
+}
+
+fn plan_seeded_fanout_segments(
+    config: &RuntimeScanConfig,
+    full_limit: usize,
+    estimated_signatures: usize,
+    left_frontier: &FullTransactionRecord,
+    right_frontier: &FullTransactionRecord,
+) -> Vec<SeededFanoutSegment> {
+    let max_segments = config.concurrency.min(SEEDED_FANOUT_MAX_SEGMENTS).max(4);
+    let estimated_pages = estimated_signatures.div_ceil(full_limit.max(1));
+    let segment_count = estimated_pages
+        .div_ceil(SEEDED_FANOUT_TARGET_PAGES_PER_SEGMENT)
+        .clamp(4, max_segments);
+
+    let start = left_frontier.slot;
+    let end = right_frontier.slot;
+    let slot_span = end.saturating_sub(start).saturating_add(1);
+
+    let mut start_slots = Vec::new();
+    for index in 0..segment_count {
+        let offset = ((u128::from(slot_span) * index as u128) / segment_count as u128)
+            .min(u128::from(u64::MAX)) as u64;
+        let slot = start.saturating_add(offset).min(end);
+        if start_slots.last().copied() != Some(slot) {
+            start_slots.push(slot);
+        }
+    }
+
+    if start_slots.is_empty() {
+        start_slots.push(start);
+    }
+
+    start_slots
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| SeededFanoutSegment {
+            start_slot: *slot,
+            end_slot_exclusive: start_slots.get(index + 1).copied(),
+            lower_exclusive: (index == 0)
+                .then(|| signature_record_from_full_transaction(left_frontier)),
+            upper_exclusive: (index + 1 == start_slots.len())
+                .then(|| signature_record_from_full_transaction(right_frontier)),
+        })
+        .collect()
+}
+
+async fn fetch_seeded_segment_transactions(
+    client: &(impl TransactionsSource + ?Sized),
+    address: &str,
+    context: ScanContext,
+    full_limit: usize,
+    segment: SeededFanoutSegment,
+) -> Result<Vec<FullTransactionRecord>, ScanError> {
+    let initial_token = seeded_fanout_token(segment.start_slot);
+    let mut pagination_token = Some(initial_token.clone());
+    let mut records = Vec::new();
+    let mut first_page = true;
+
+    loop {
+        let page = get_full_page_unfiltered(
+            client,
+            address,
+            context.clone(),
+            SortOrder::Asc,
+            full_limit,
+            pagination_token.take(),
+        )
+        .await?;
+
+        if page.data.is_empty() {
+            break;
+        }
+
+        if first_page {
+            first_page = false;
+            let first_slot = page
+                .data
+                .first()
+                .map(|record| record.slot)
+                .unwrap_or_default();
+            if first_slot < segment.start_slot.saturating_sub(1) {
+                return Err(ScanError::Client(
+                    HeliusClientError::InvalidPaginationToken {
+                        token: initial_token,
+                    },
+                ));
+            }
+        }
+
+        let reached_upper_boundary = page
+            .data
+            .last()
+            .is_some_and(|record| seeded_segment_reached_upper_boundary(record, &segment));
+
+        records.extend(
+            page.data
+                .into_iter()
+                .filter(|record| full_record_in_seeded_segment(record, &segment)),
+        );
+
+        let Some(next_token) = page.pagination_token else {
+            break;
+        };
+        if reached_upper_boundary {
+            break;
+        }
+        pagination_token = Some(next_token);
+    }
+
+    Ok(records)
+}
+
+fn seeded_fanout_token(start_slot: u64) -> String {
+    format!("{}:0", start_slot.saturating_sub(1))
+}
+
+fn full_record_in_seeded_segment(
+    record: &FullTransactionRecord,
+    segment: &SeededFanoutSegment,
+) -> bool {
+    if record.slot < segment.start_slot {
+        return false;
+    }
+
+    if let Some(lower_exclusive) = segment.lower_exclusive.as_ref()
+        && compare_full_record_to_signature_record(record, lower_exclusive) != Ordering::Greater
+    {
+        return false;
+    }
+
+    if let Some(end_slot) = segment.end_slot_exclusive
+        && record.slot >= end_slot
+    {
+        return false;
+    }
+
+    if let Some(upper_exclusive) = segment.upper_exclusive.as_ref()
+        && compare_full_record_to_signature_record(record, upper_exclusive) != Ordering::Less
+    {
+        return false;
+    }
+
+    true
+}
+
+fn seeded_segment_reached_upper_boundary(
+    record: &FullTransactionRecord,
+    segment: &SeededFanoutSegment,
+) -> bool {
+    if let Some(end_slot) = segment.end_slot_exclusive
+        && record.slot >= end_slot
+    {
+        return true;
+    }
+
+    if let Some(upper_exclusive) = segment.upper_exclusive.as_ref() {
+        return compare_full_record_to_signature_record(record, upper_exclusive) != Ordering::Less;
+    }
+
+    false
 }
 
 fn should_use_parallel_dense_range_search(
@@ -1249,6 +1694,47 @@ async fn get_full_page(
     limit: usize,
     pagination_token: Option<String>,
 ) -> Result<GtfaPage<FullTransactionRecord>, ScanError> {
+    get_full_page_with_filters(
+        client,
+        address,
+        context,
+        sort_order,
+        limit,
+        Some(Filters::slot_range(range.start, range.end)),
+        pagination_token,
+    )
+    .await
+}
+
+async fn get_full_page_unfiltered(
+    client: &(impl TransactionsSource + ?Sized),
+    address: &str,
+    context: ScanContext,
+    sort_order: SortOrder,
+    limit: usize,
+    pagination_token: Option<String>,
+) -> Result<GtfaPage<FullTransactionRecord>, ScanError> {
+    get_full_page_with_filters(
+        client,
+        address,
+        context,
+        sort_order,
+        limit,
+        None,
+        pagination_token,
+    )
+    .await
+}
+
+async fn get_full_page_with_filters(
+    client: &(impl TransactionsSource + ?Sized),
+    address: &str,
+    context: ScanContext,
+    sort_order: SortOrder,
+    limit: usize,
+    filters: Option<Filters>,
+    pagination_token: Option<String>,
+) -> Result<GtfaPage<FullTransactionRecord>, ScanError> {
     let _permit = context
         .semaphore
         .acquire_owned()
@@ -1259,12 +1745,8 @@ async fn get_full_page(
         .full_requests
         .fetch_add(1, AtomicOrdering::Relaxed);
 
-    let config = GetTransactionsConfig::full(
-        sort_order,
-        limit,
-        Some(Filters::slot_range(range.start, range.end)),
-    )
-    .with_pagination_token(pagination_token);
+    let config = GetTransactionsConfig::full(sort_order, limit, filters)
+        .with_pagination_token(pagination_token);
     Ok(client.get_full_transactions(address, config).await?)
 }
 
@@ -1370,6 +1852,22 @@ fn full_record_order(left: &FullTransactionRecord, right: &FullTransactionRecord
     }
 }
 
+fn compare_full_record_to_signature_record(
+    record: &FullTransactionRecord,
+    boundary: &SignatureRecord,
+) -> Ordering {
+    match record.slot.cmp(&boundary.slot) {
+        Ordering::Equal => match record.transaction_index.cmp(&boundary.transaction_index) {
+            Ordering::Equal => record
+                .primary_signature()
+                .unwrap_or_default()
+                .cmp(boundary.signature.as_str()),
+            other => other,
+        },
+        other => other,
+    }
+}
+
 fn same_signature_record(left: &SignatureRecord, right: &SignatureRecord) -> bool {
     if !left.signature.is_empty() && !right.signature.is_empty() {
         return left.signature == right.signature;
@@ -1430,6 +1928,18 @@ fn trim_full_records(
 
 fn signature_pagination_token(record: &SignatureRecord) -> String {
     format!("{}:{}", record.slot, record.transaction_index)
+}
+
+fn signature_record_from_full_transaction(record: &FullTransactionRecord) -> SignatureRecord {
+    SignatureRecord {
+        signature: record.primary_signature().unwrap_or_default().to_owned(),
+        slot: record.slot,
+        transaction_index: record.transaction_index,
+        err: record.meta.as_ref().and_then(|meta| meta.err.clone()),
+        memo: None,
+        block_time: record.block_time,
+        confirmation_status: Some("finalized".to_owned()),
+    }
 }
 
 fn build_timeline_entries(
@@ -1875,7 +2385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_dense_wallet_prefers_parallel_range_discovery_with_headroom() {
+    async fn large_dense_wallet_prefers_seeded_full_fanout_with_headroom() {
         let transactions = (0..20_000u32)
             .map(|index| {
                 full_tx(
@@ -1909,8 +2419,54 @@ mod tests {
         .expect("scan output");
 
         assert_eq!(output.entries.len(), 20_000);
-        assert!(output.stats.signature_requests > 4);
-        assert!(output.stats.max_discovery_depth > 0);
+        assert_eq!(output.stats.signature_requests, 2);
+        assert_eq!(output.stats.max_discovery_depth, 0);
+        assert!(output.stats.full_requests > 200);
+    }
+
+    #[tokio::test]
+    async fn seeded_full_fanout_preserves_multi_transaction_slot_boundaries() {
+        let mut transactions = Vec::new();
+        let mut balance = 0u64;
+        for slot in 0..10_000u64 {
+            for transaction_index in 0..2u32 {
+                let next_balance = balance + 1;
+                transactions.push(full_tx(
+                    "target",
+                    &format!("sig-{slot}-{transaction_index}"),
+                    slot + 1,
+                    transaction_index,
+                    balance,
+                    next_balance,
+                ));
+                balance = next_balance;
+            }
+        }
+
+        let client = FixtureClient::from_fixture(FixtureData {
+            address: Some("target".to_owned()),
+            transactions,
+        })
+        .expect("fixture client");
+
+        let output = reconstruct_sol_balance_timeline(
+            &client,
+            "target",
+            RuntimeScanConfig {
+                concurrency: 64,
+                scout_limit: 1000,
+                full_limit: 100,
+                rpc_rps: None,
+            },
+        )
+        .await
+        .expect("scan output");
+
+        assert_eq!(output.entries.len(), 20_000);
+        assert_eq!(output.initial_balance_lamports, Some(0));
+        assert_eq!(output.final_balance_lamports, Some(20_000));
+        assert_eq!(output.stats.signature_requests, 2);
+        assert_eq!(output.stats.max_discovery_depth, 0);
     }
 
     #[tokio::test]
