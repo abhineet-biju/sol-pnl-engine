@@ -101,9 +101,34 @@ pub struct ScanStats {
     pub max_discovery_depth: usize,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanStrategy {
+    Empty,
+    BoundaryOnly,
+    SeededFullFanout,
+    SparseRecursive,
+    DenseParallelRange,
+    DensePincer,
+}
+
+impl ScanStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::BoundaryOnly => "boundary_only",
+            Self::SeededFullFanout => "seeded_full_fanout",
+            Self::SparseRecursive => "sparse_recursive",
+            Self::DenseParallelRange => "dense_parallel_range",
+            Self::DensePincer => "dense_pincer",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TimelineOutput {
     pub address: String,
+    pub strategy: ScanStrategy,
     pub initial_balance_lamports: Option<u64>,
     pub final_balance_lamports: Option<u64>,
     pub entries: Vec<TimelineEntry>,
@@ -232,6 +257,7 @@ pub async fn reconstruct_sol_balance_timeline(
 
         return Ok(TimelineOutput {
             address: address.to_owned(),
+            strategy: ScanStrategy::Empty,
             initial_balance_lamports: None,
             final_balance_lamports: None,
             entries: Vec::new(),
@@ -247,6 +273,7 @@ pub async fn reconstruct_sol_balance_timeline(
 
         return Ok(TimelineOutput {
             address: address.to_owned(),
+            strategy: ScanStrategy::Empty,
             initial_balance_lamports: None,
             final_balance_lamports: None,
             entries: Vec::new(),
@@ -263,6 +290,12 @@ pub async fn reconstruct_sol_balance_timeline(
     let mut prefetched_full_transactions = None;
     let mut prefetched_fetch_jobs = None;
     let mut prefetched_signatures = None;
+
+    let mut strategy = if history_fits_boundary_pages {
+        ScanStrategy::BoundaryOnly
+    } else {
+        ScanStrategy::DensePincer
+    };
 
     let mut signatures = if history_fits_boundary_pages {
         let mut signatures = oldest_page.data.clone();
@@ -301,6 +334,7 @@ pub async fn reconstruct_sol_balance_timeline(
             .await?
             {
                 Some(seeded_result) => {
+                    strategy = ScanStrategy::SeededFullFanout;
                     prefetched_fetch_jobs = Some(seeded_result.fetch_jobs);
                     prefetched_full_transactions = Some(seeded_result.full_transactions);
                     prefetched_signatures = Some(seeded_result.signatures);
@@ -336,6 +370,7 @@ pub async fn reconstruct_sol_balance_timeline(
         if prefetched_full_transactions.is_some() {
             prefetched_signatures.take().unwrap_or_default()
         } else if should_use_sparse_search {
+            strategy = ScanStrategy::SparseRecursive;
             let mut signatures = oldest_page.data.clone();
             signatures.extend(newest_page.data.clone());
             discover_signatures_in_range(
@@ -361,6 +396,7 @@ pub async fn reconstruct_sol_balance_timeline(
             &newest_page,
             signature_range,
         ) {
+            strategy = ScanStrategy::DenseParallelRange;
             let mut signatures = oldest_page.data.clone();
             signatures.extend(newest_page.data.clone());
             discover_signatures_in_range(
@@ -381,6 +417,7 @@ pub async fn reconstruct_sol_balance_timeline(
                 merged
             })?
         } else {
+            strategy = ScanStrategy::DensePincer;
             let dense_result = discover_and_fetch_dense_history(
                 client,
                 address,
@@ -438,6 +475,7 @@ pub async fn reconstruct_sol_balance_timeline(
 
     Ok(TimelineOutput {
         address: address.to_owned(),
+        strategy,
         initial_balance_lamports: entries.first().map(|entry| entry.pre_balance_lamports),
         final_balance_lamports: entries.last().map(|entry| entry.post_balance_lamports),
         entries,
@@ -2014,8 +2052,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::{
-        FullFetchJob, RuntimeScanConfig, build_full_fetch_jobs, build_timeline_entries,
-        reconstruct_sol_balance_timeline, sort_and_dedup_signatures,
+        FullFetchJob, RuntimeScanConfig, ScanStrategy, build_full_fetch_jobs,
+        build_timeline_entries, reconstruct_sol_balance_timeline, sort_and_dedup_signatures,
     };
     use crate::client::{FixtureClient, FixtureData};
     use crate::model::{
@@ -2314,6 +2352,7 @@ mod tests {
         assert_eq!(output.entries.len(), 3);
         assert_eq!(output.stats.signature_requests, 2);
         assert_eq!(output.stats.max_discovery_depth, 0);
+        assert_eq!(output.strategy, ScanStrategy::BoundaryOnly);
     }
 
     #[tokio::test]
@@ -2343,6 +2382,7 @@ mod tests {
 
         assert_eq!(output.entries.len(), 3);
         assert!(output.stats.max_discovery_depth > 0);
+        assert_eq!(output.strategy, ScanStrategy::SparseRecursive);
     }
 
     #[tokio::test]
@@ -2382,6 +2422,7 @@ mod tests {
         assert_eq!(output.entries.len(), 2_500);
         assert_eq!(output.stats.signature_requests, 4);
         assert_eq!(output.stats.max_discovery_depth, 0);
+        assert_eq!(output.strategy, ScanStrategy::DensePincer);
     }
 
     #[tokio::test]
@@ -2422,6 +2463,7 @@ mod tests {
         assert_eq!(output.stats.signature_requests, 2);
         assert_eq!(output.stats.max_discovery_depth, 0);
         assert!(output.stats.full_requests > 200);
+        assert_eq!(output.strategy, ScanStrategy::SeededFullFanout);
     }
 
     #[tokio::test]
@@ -2467,6 +2509,7 @@ mod tests {
         assert_eq!(output.final_balance_lamports, Some(20_000));
         assert_eq!(output.stats.signature_requests, 2);
         assert_eq!(output.stats.max_discovery_depth, 0);
+        assert_eq!(output.strategy, ScanStrategy::SeededFullFanout);
     }
 
     #[tokio::test]
@@ -2506,6 +2549,7 @@ mod tests {
         assert_eq!(output.entries.len(), 20_000);
         assert_eq!(output.stats.max_discovery_depth, 0);
         assert_eq!(output.stats.signature_requests, 24);
+        assert_eq!(output.strategy, ScanStrategy::DensePincer);
     }
 
     #[tokio::test]

@@ -218,6 +218,7 @@ fn emit_scan_summary(
     if let Some(endpoint_kind) = endpoint_kind {
         eprintln!("endpoint: {endpoint_kind}");
     }
+    eprintln!("strategy: {}", output.strategy.as_str());
     eprintln!("address: {}", output.address);
     eprintln!("output: {}", output_path.display());
     eprintln!("wall time: {}", format_duration(elapsed));

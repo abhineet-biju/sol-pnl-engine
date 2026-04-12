@@ -16,6 +16,7 @@ cargo run -- --api-key YOUR_KEY --address 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbb
 scan complete
 source: live
 endpoint: helius beta
+strategy: dense_pincer
 address: 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds
 wall time: 14.56s
 entries: 6093 | signature requests: 8 | full requests: 61
@@ -188,6 +189,7 @@ The JSON output written to file:
 ```json
 {
   "address": "2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds",
+  "strategy": "dense_pincer",
   "initial_balance_lamports": 0,
   "final_balance_lamports": 899990000,
   "entries": [
@@ -212,6 +214,17 @@ The JSON output written to file:
   }
 }
 ```
+
+### Top-level fields
+
+| Field | Description |
+|---|---|
+| `address` | Target wallet address |
+| `strategy` | Which runtime strategy won the classifier (`boundary_only`, `seeded_full_fanout`, `sparse_recursive`, `dense_parallel_range`, `dense_pincer`, or `empty`) |
+| `initial_balance_lamports` | Native SOL balance before the first included transaction |
+| `final_balance_lamports` | Native SOL balance after the last included transaction |
+| `entries` | Per-transaction balance timeline |
+| `stats` | Request and discovery counters for the run |
 
 ### Entry fields
 
