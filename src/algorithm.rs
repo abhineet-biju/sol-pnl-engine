@@ -32,6 +32,12 @@ impl SlotRange {
 const DENSITY_SAFETY_FACTOR: f64 = 1.5;
 const MAX_ADAPTIVE_WINDOWS: u64 = 16;
 const SPARSE_GAP_MULTIPLIER: u64 = 8;
+const PARALLEL_DENSE_MIN_CONCURRENCY: usize = 32;
+const PARALLEL_DENSE_MIN_ESTIMATED_SIGNATURES_MULTIPLIER: usize = 8;
+const PARALLEL_DENSE_MIN_RPS: u32 = 200;
+const PARALLEL_DENSE_MIN_WAVE_ADVANTAGE: usize = 4;
+const SPARSE_CONFIRMATION_MIN_SAMPLE_SIZE: usize = 256;
+const SPARSE_CONFIRMATION_SHRINK_FACTOR: u64 = 4;
 
 #[derive(Clone)]
 struct ScanContext {
@@ -96,6 +102,7 @@ pub struct RuntimeScanConfig {
     pub concurrency: usize,
     pub scout_limit: usize,
     pub full_limit: usize,
+    pub rpc_rps: Option<u32>,
 }
 
 impl Default for RuntimeScanConfig {
@@ -104,6 +111,7 @@ impl Default for RuntimeScanConfig {
             concurrency: 32,
             scout_limit: 1000,
             full_limit: 100,
+            rpc_rps: None,
         }
     }
 }
@@ -258,7 +266,54 @@ pub async fn reconstruct_sol_balance_timeline(
             .cloned()
             .expect("non-empty boundary page");
 
-        if should_use_sparse_gap_search(&oldest_page, &newest_page) {
+        let should_use_sparse_search = if should_use_sparse_gap_search(&oldest_page, &newest_page) {
+            if should_confirm_sparse_gap_classification(
+                &config,
+                &oldest_page,
+                &newest_page,
+                signature_range,
+            ) {
+                confirm_sparse_gap_search(
+                    client,
+                    address,
+                    context.clone(),
+                    left_frontier.slot,
+                    right_frontier.slot,
+                )
+                .await?
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+
+        if should_use_sparse_search {
+            let mut signatures = oldest_page.data.clone();
+            signatures.extend(newest_page.data.clone());
+            discover_signatures_in_range(
+                client,
+                address,
+                SlotRange {
+                    start: left_frontier.slot,
+                    end: right_frontier.slot,
+                },
+                context.clone(),
+                scout_limit,
+                0,
+            )
+            .await
+            .map(|middle| {
+                let mut merged = signatures;
+                merged.extend(middle);
+                merged
+            })?
+        } else if should_use_parallel_dense_range_search(
+            &config,
+            &oldest_page,
+            &newest_page,
+            signature_range,
+        ) {
             let mut signatures = oldest_page.data.clone();
             signatures.extend(newest_page.data.clone());
             discover_signatures_in_range(
@@ -394,6 +449,162 @@ fn should_use_sparse_gap_search(
     let covered_span = left_span.saturating_add(right_span);
 
     gap_span > covered_span.saturating_mul(SPARSE_GAP_MULTIPLIER)
+}
+
+fn should_confirm_sparse_gap_classification(
+    config: &RuntimeScanConfig,
+    asc_page: &GtfaPage<SignatureRecord>,
+    desc_page: &GtfaPage<SignatureRecord>,
+    range: SlotRange,
+) -> bool {
+    let scout_limit = config.scout_limit.max(1);
+    if scout_limit < SPARSE_CONFIRMATION_MIN_SAMPLE_SIZE {
+        return false;
+    }
+
+    if asc_page.data.len() < scout_limit || desc_page.data.len() < scout_limit {
+        return false;
+    }
+
+    estimate_dense_signature_count(asc_page, desc_page, range).is_some_and(|estimated| {
+        estimated >= scout_limit.saturating_mul(PARALLEL_DENSE_MIN_ESTIMATED_SIGNATURES_MULTIPLIER)
+    })
+}
+
+async fn confirm_sparse_gap_search(
+    client: &(impl TransactionsSource + ?Sized),
+    address: &str,
+    context: ScanContext,
+    left_slot: u64,
+    right_slot: u64,
+) -> Result<bool, ScanError> {
+    if left_slot >= right_slot {
+        return Ok(false);
+    }
+
+    let range = SlotRange {
+        start: left_slot,
+        end: right_slot,
+    };
+    let mid = range.midpoint();
+    if mid >= range.end {
+        return Ok(false);
+    }
+
+    let (left_probe, right_probe) = tokio::join!(
+        get_signatures_page(
+            client,
+            address,
+            context.clone(),
+            SlotRange {
+                start: range.start,
+                end: mid,
+            },
+            SortOrder::Desc,
+            1,
+            None,
+        ),
+        get_signatures_page(
+            client,
+            address,
+            context,
+            SlotRange {
+                start: mid + 1,
+                end: range.end,
+            },
+            SortOrder::Asc,
+            1,
+            None,
+        )
+    );
+
+    let left_probe = left_probe?;
+    let right_probe = right_probe?;
+
+    let Some(left_midpoint_slot) = left_probe.data.first().map(|record| record.slot) else {
+        return Ok(true);
+    };
+    let Some(right_midpoint_slot) = right_probe.data.first().map(|record| record.slot) else {
+        return Ok(true);
+    };
+
+    let original_gap = right_slot.saturating_sub(left_slot);
+    let narrowed_gap = right_midpoint_slot.saturating_sub(left_midpoint_slot);
+
+    Ok(narrowed_gap > original_gap / SPARSE_CONFIRMATION_SHRINK_FACTOR)
+}
+
+fn should_use_parallel_dense_range_search(
+    config: &RuntimeScanConfig,
+    asc_page: &GtfaPage<SignatureRecord>,
+    desc_page: &GtfaPage<SignatureRecord>,
+    range: SlotRange,
+) -> bool {
+    if config.concurrency < PARALLEL_DENSE_MIN_CONCURRENCY {
+        return false;
+    }
+
+    if let Some(rpc_rps) = config.rpc_rps {
+        if rpc_rps < PARALLEL_DENSE_MIN_RPS {
+            return false;
+        }
+    }
+
+    let scout_limit = config.scout_limit.max(1);
+    let full_limit = config.full_limit.max(1);
+
+    if asc_page.data.len() < scout_limit || desc_page.data.len() < scout_limit {
+        return false;
+    }
+
+    let Some(estimated_signatures) = estimate_dense_signature_count(asc_page, desc_page, range)
+    else {
+        return false;
+    };
+
+    if estimated_signatures
+        < scout_limit.saturating_mul(PARALLEL_DENSE_MIN_ESTIMATED_SIGNATURES_MULTIPLIER)
+    {
+        return false;
+    }
+
+    let pincer_rounds = estimated_signatures.div_ceil(scout_limit.saturating_mul(2));
+    let full_fetch_waves =
+        estimated_signatures.div_ceil(full_limit.saturating_mul(config.concurrency));
+
+    pincer_rounds > full_fetch_waves.saturating_add(PARALLEL_DENSE_MIN_WAVE_ADVANTAGE)
+}
+
+fn estimate_dense_signature_count(
+    asc_page: &GtfaPage<SignatureRecord>,
+    desc_page: &GtfaPage<SignatureRecord>,
+    range: SlotRange,
+) -> Option<usize> {
+    let left_first = asc_page.data.first()?;
+    let left_last = asc_page.data.last()?;
+    let right_first = desc_page.data.first()?;
+    let right_last = desc_page.data.last()?;
+
+    let left_span = left_last
+        .slot
+        .saturating_sub(left_first.slot)
+        .saturating_add(1);
+    let right_span = right_first
+        .slot
+        .saturating_sub(right_last.slot)
+        .saturating_add(1);
+
+    if left_span == 0 || right_span == 0 {
+        return None;
+    }
+
+    let left_density = asc_page.data.len() as f64 / left_span as f64;
+    let right_density = desc_page.data.len() as f64 / right_span as f64;
+    let estimated_from_density = left_density.min(right_density) * range.span() as f64;
+    let observed_boundary_count = asc_page.data.len().saturating_add(desc_page.data.len());
+
+    Some(estimated_from_density.ceil() as usize)
+        .map(|estimate| estimate.max(observed_boundary_count))
 }
 
 async fn discover_and_fetch_dense_history(
@@ -1543,6 +1754,7 @@ mod tests {
                 concurrency: 4,
                 scout_limit: 2,
                 full_limit: 2,
+                rpc_rps: None,
             },
         )
         .await
@@ -1583,6 +1795,7 @@ mod tests {
                 concurrency: 4,
                 scout_limit: 1000,
                 full_limit: 2,
+                rpc_rps: None,
             },
         )
         .await
@@ -1612,6 +1825,7 @@ mod tests {
                 concurrency: 4,
                 scout_limit: 1,
                 full_limit: 2,
+                rpc_rps: None,
             },
         )
         .await
@@ -1649,6 +1863,7 @@ mod tests {
                 concurrency: 16,
                 scout_limit: 1000,
                 full_limit: 100,
+                rpc_rps: None,
             },
         )
         .await
@@ -1657,6 +1872,84 @@ mod tests {
         assert_eq!(output.entries.len(), 2_500);
         assert_eq!(output.stats.signature_requests, 4);
         assert_eq!(output.stats.max_discovery_depth, 0);
+    }
+
+    #[tokio::test]
+    async fn large_dense_wallet_prefers_parallel_range_discovery_with_headroom() {
+        let transactions = (0..20_000u32)
+            .map(|index| {
+                full_tx(
+                    "target",
+                    &format!("sig-{index}"),
+                    u64::from(index) + 1,
+                    0,
+                    u64::from(index),
+                    u64::from(index) + 1,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let client = FixtureClient::from_fixture(FixtureData {
+            address: Some("target".to_owned()),
+            transactions,
+        })
+        .expect("fixture client");
+
+        let output = reconstruct_sol_balance_timeline(
+            &client,
+            "target",
+            RuntimeScanConfig {
+                concurrency: 64,
+                scout_limit: 1000,
+                full_limit: 100,
+                rpc_rps: None,
+            },
+        )
+        .await
+        .expect("scan output");
+
+        assert_eq!(output.entries.len(), 20_000);
+        assert!(output.stats.signature_requests > 4);
+        assert!(output.stats.max_discovery_depth > 0);
+    }
+
+    #[tokio::test]
+    async fn large_dense_wallet_keeps_pincer_when_rpc_cap_is_low() {
+        let transactions = (0..20_000u32)
+            .map(|index| {
+                full_tx(
+                    "target",
+                    &format!("sig-{index}"),
+                    u64::from(index) + 1,
+                    0,
+                    u64::from(index),
+                    u64::from(index) + 1,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let client = FixtureClient::from_fixture(FixtureData {
+            address: Some("target".to_owned()),
+            transactions,
+        })
+        .expect("fixture client");
+
+        let output = reconstruct_sol_balance_timeline(
+            &client,
+            "target",
+            RuntimeScanConfig {
+                concurrency: 64,
+                scout_limit: 1000,
+                full_limit: 100,
+                rpc_rps: Some(100),
+            },
+        )
+        .await
+        .expect("scan output");
+
+        assert_eq!(output.entries.len(), 20_000);
+        assert_eq!(output.stats.max_discovery_depth, 0);
+        assert_eq!(output.stats.signature_requests, 24);
     }
 
     #[tokio::test]
@@ -1687,6 +1980,7 @@ mod tests {
                 concurrency: 4,
                 scout_limit: 2,
                 full_limit: 2,
+                rpc_rps: None,
             },
         )
         .await

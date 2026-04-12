@@ -25,7 +25,7 @@ struct Cli {
         long,
         env = "HELIUS_API_KEY",
         conflicts_with = "fixture",
-        help = "Helius API key. Builds the default mainnet RPC URL automatically."
+        help = "Helius API key. Uses the default beta RPC URL automatically, with mainnet fallback if beta fails."
     )]
     api_key: Option<String>,
     #[arg(
@@ -102,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         concurrency: resolve_concurrency(concurrency, effective_rpc_rps),
         scout_limit: scout_limit.clamp(1, 1000),
         full_limit: full_limit.clamp(1, 100),
+        rpc_rps: effective_rpc_rps,
     };
 
     let scan_started_at = Instant::now();

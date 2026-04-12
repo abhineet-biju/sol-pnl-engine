@@ -1,4 +1,4 @@
-# sol-pnl-engine
+# sol-balance-runtime
 
 Reconstructs a Solana wallet's **native SOL balance over time** using only Helius [`getTransactionsForAddress`](https://docs.helius.dev/solana-rpc-nodes/enhanced-methods/getTransactionsForAddress). No indexing, no database, just RPC.
 
@@ -31,12 +31,14 @@ The algorithm exploits `getTransactionsForAddress`'s bidirectional sorting and s
 | Wallet type | What happens | Signature requests |
 |---|---|---|
 | Small (<=1000 txs) | Two parallel boundary probes cover the entire history | **2** |
-| Dense (thousands of txs) | Bidirectional pincer sweep from both ends, meeting in the middle | **~2 per 1000 txs** |
+| Dense (thousands of txs) | Bidirectional pincer sweep by default, with dense fanout for very large histories when RPC headroom is available | **~2 per 1000 txs** |
 | Sparse (gaps between activity) | Recursive binary search over slot ranges with adaptive subrange splitting | **varies, but parallelized** |
 
 **Key optimizations:**
 
 - **Pipelined fetching**: for dense wallets, full-transaction fetches fire as soon as each signature page arrives, overlapping discovery and data retrieval. Phases 2 and 3 run concurrently, not sequentially.
+- **Dense fanout when it helps**: for very large, clearly dense wallets with enough concurrency and RPC headroom, the scanner switches from a stepwise pincer walk to parallel range discovery. Smaller or rate-limited runs keep the lower-call-count pincer path.
+- **Sparse-gap confirmation**: when a very large wallet initially looks sparse from the boundary pages alone, the scanner sends a midpoint confirmation probe before committing to recursive search. This prevents uniform high-volume histories from being misclassified as sparse.
 - **Signatures-first discovery**: uses `transactionDetails: signatures` (lightweight) to map the history before requesting full transactions (heavy). This minimizes bandwidth and response times during the search phase.
 - **Adaptive subrange planning**: for sparse wallets, the first page's density is used to estimate optimal slot-range windows. Up to 16 subranges are searched in parallel instead of walking the ledger sequentially.
 - **Probe-and-narrow**: when splitting ranges, the algorithm sends single-record probes (`limit=1`) to find the tightest bounding slots on each side before recursing, avoiding wasted requests on empty ranges.
@@ -110,11 +112,13 @@ Two requests fire simultaneously:
 
 If the two pages overlap, the entire history is already known. **The small-wallet fast path completes signature discovery in exactly 2 requests.**
 
-If they don't overlap, the gap between the two frontiers determines whether the history looks dense or sparse.
+If they don't overlap, the gap between the two frontiers determines whether the history looks dense or sparse. For very large ambiguous gaps, the scanner also sends a midpoint confirmation probe before it commits to the sparse path.
 
 ### Phase 2: discover all signatures
 
-**Dense path**: the two boundary pages didn't overlap, but the gap is compact relative to the covered span (gap < 8x the already-covered slot range). The scanner continues paginating from both ends simultaneously, letting the two cursors meet in the middle. As each signature page arrives, its corresponding full-transaction fetch jobs are **immediately dispatched**. Signature discovery and full-transaction fetching run concurrently.
+**Dense path**: the two boundary pages didn't overlap, but the gap is compact relative to the covered span (gap < 8x the already-covered slot range). The default path continues paginating from both ends simultaneously, letting the two cursors meet in the middle. As each signature page arrives, its corresponding full-transaction fetch jobs are **immediately dispatched**. Signature discovery and full-transaction fetching run concurrently.
+
+For very large dense wallets, the scanner can switch to a parallel range-discovery mode instead. This only activates when the boundary pages imply a large dense history and the runtime has enough concurrency and RPC headroom for extra fanout to pay off. In lower-headroom runs, it stays on the lower-call-count pincer path.
 
 **Sparse path**: the gap is large relative to the covered span. The scanner recursively splits the remaining slot range and searches each subrange in parallel. Before recursing, it sends 1-record probes to find the tightest bounding slots on each side, avoiding wasted requests on empty gaps. An adaptive subrange planner uses observed density to estimate optimal window sizes, capped at 16 parallel subranges.
 
@@ -147,7 +151,7 @@ The final timeline is sorted by `(slot, transactionIndex, signature)`. Failed tr
 ## CLI reference
 
 ```
-sol-pnl-engine [OPTIONS]
+sol-balance-runtime [OPTIONS]
 ```
 
 ### Input source (pick exactly one)
@@ -155,7 +159,7 @@ sol-pnl-engine [OPTIONS]
 | Flag | Env var | Description |
 |---|---|---|
 | `--rpc-url <URL>` | `HELIUS_RPC_URL` | Live Helius RPC endpoint |
-| `--api-key <KEY>` | `HELIUS_API_KEY` | Helius API key (builds default mainnet URL) |
+| `--api-key <KEY>` | `HELIUS_API_KEY` | Helius API key (uses the beta endpoint by default, with mainnet fallback) |
 | `--fixture <PATH>` | - | Local fixture file for offline replay |
 
 ### Required with live sources
