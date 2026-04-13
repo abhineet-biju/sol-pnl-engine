@@ -1,4 +1,4 @@
-# sol-balance-runtime
+# sol-pnl-engine
 
 Reconstructs a Solana wallet's **native SOL balance over time** using only Helius [`getTransactionsForAddress`](https://www.helius.dev/docs/rpc/gettransactionsforaddress). No indexing, no database, just RPC.
 
@@ -9,10 +9,10 @@ Built for [Mert's latency challenge](https://x.com/mert/status/20429414212970501
 > **Latency default:** `--api-key` runs against Helius beta / Gatekeeper-style infrastructure by default for lower latency, and automatically falls back to the standard mainnet endpoint if beta is unavailable. Use `--rpc-url` if you want to force a specific endpoint.
 
 ```bash
-cargo run -- --api-key YOUR_KEY --address 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds --plan developer
+cargo run -- --api-key YOUR_KEY --address 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds --plan professional
 ```
 
-Representative terminal output from the command above:
+Representative terminal output from a comparable live run:
 
 ```text
 scan complete
@@ -23,14 +23,14 @@ address: 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds
 output: outputs/2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds.json
 wall time: 22.84s
 entries: 6093 | signature requests: 8 | full requests: 61
-concurrency: 50 | rpc pacing: 50 req/s
+concurrency: 50 | client pacing: 50 req/s
 http attempts: 69 | retries: 0 | cumulative http time: 500.38s | avg per attempt: 7.25s
 first completed rpc attempt: 2.01s (includes initial connection/TLS setup on a cold client)
 ```
 
 This is representative live output, not a guaranteed benchmark. Wall time depends on current Helius load, your pacing cap, chosen concurrency, and whether the client is cold or warm.
 
-In the sample above, 6,093 transactions were discovered in **8 signature requests** and the full history was reconstructed in **22.84s** at Developer-plan pacing.
+In the sample above, 6,093 transactions were discovered in **8 signature requests** and the full history was reconstructed in **22.84s** under rate-limited client pacing.
 
 ## Why it's fast
 
@@ -93,7 +93,7 @@ Both `--api-key` and `--rpc-url` can also be set via environment variables (`HEL
 If your Helius plan has a request cap, use `--plan` to set automatic pacing:
 
 ```bash
-cargo run -- --api-key YOUR_KEY --address YOUR_WALLET --plan developer
+cargo run -- --api-key YOUR_KEY --address YOUR_WALLET --plan professional
 ```
 
 | Plan | Requests/sec |
@@ -182,9 +182,9 @@ sol-balance-runtime [OPTIONS]
 
 | Flag | Default | Description |
 |---|---|---|
-| `--plan <PLAN>` | - | Helius plan preset for automatic request pacing |
+| `--plan <PLAN>` | - | Helius plan preset for client-side request pacing only. Actual server-side limits still depend on the API key's plan |
 | `--rpc-rps <N>` | unbounded | Explicit requests-per-second cap (overrides `--plan`) |
-| `--concurrency <N>` | 32 (or up to 64 by default when pacing is enabled) | Maximum concurrent in-flight requests |
+| `--concurrency <N>` | 32 (or `rpc-rps` value if higher) | Maximum concurrent in-flight requests |
 | `--scout-limit <N>` | 1000 | Page size for signature discovery (1–1000) |
 | `--full-limit <N>` | 100 | Page size for full transaction fetches (1–100) |
 | `--strategy-preference <MODE>` | `auto` | Optional override for benchmarking (`auto`, `seeded-full-fanout`, `dense-pincer`, `dense-parallel-range`, `sparse-recursive`) |

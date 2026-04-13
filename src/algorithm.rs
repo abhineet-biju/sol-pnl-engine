@@ -2823,6 +2823,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strategy_preference_can_force_dense_parallel_range() {
+        let transactions = (0..2_500u32)
+            .map(|index| {
+                full_tx(
+                    "target",
+                    &format!("sig-{index}"),
+                    u64::from(index) + 1,
+                    0,
+                    u64::from(index),
+                    u64::from(index) + 1,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let client = FixtureClient::from_fixture(FixtureData {
+            address: Some("target".to_owned()),
+            transactions,
+        })
+        .expect("fixture client");
+
+        let output = reconstruct_sol_balance_timeline(
+            &client,
+            "target",
+            RuntimeScanConfig {
+                concurrency: 64,
+                scout_limit: 1000,
+                full_limit: 100,
+                rpc_rps: Some(200),
+                strategy_preference: StrategyPreference::DenseParallelRange,
+            },
+        )
+        .await
+        .expect("scan output");
+
+        assert_eq!(output.entries.len(), 2_500);
+        assert_eq!(output.initial_balance_lamports, Some(0));
+        assert_eq!(output.final_balance_lamports, Some(2_500));
+        assert_eq!(output.strategy, ScanStrategy::DenseParallelRange);
+    }
+
+    #[tokio::test]
     async fn large_dense_wallet_prefers_seeded_full_fanout_with_headroom() {
         let transactions = (0..20_000u32)
             .map(|index| {
