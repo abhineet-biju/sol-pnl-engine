@@ -248,6 +248,12 @@ fn emit_scan_summary(
         output.stats.signature_requests,
         output.stats.full_requests
     );
+    if output.stats.elided_zero_delta_entries > 0 {
+        eprintln!(
+            "zero-delta entries elided: {}",
+            output.stats.elided_zero_delta_entries
+        );
+    }
     eprintln!(
         "concurrency: {} | client pacing: {}",
         config.concurrency,

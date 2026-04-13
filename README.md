@@ -22,7 +22,8 @@ strategy: dense_pincer
 address: 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds
 output: outputs/2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds.json
 wall time: 22.84s
-entries: 6093 | signature requests: 8 | full requests: 61
+entries: 1 | signature requests: 8 | full requests: 61
+zero-delta entries elided: 6092
 concurrency: 50 | client pacing: 50 req/s
 http attempts: 69 | retries: 0 | cumulative http time: 500.38s | avg per attempt: 7.25s
 first completed rpc attempt: 2.01s (includes initial connection/TLS setup on a cold client)
@@ -30,7 +31,7 @@ first completed rpc attempt: 2.01s (includes initial connection/TLS setup on a c
 
 This is representative live output, not a guaranteed benchmark. Wall time depends on current Helius load, your pacing cap, chosen concurrency, and whether the client is cold or warm.
 
-In the sample above, 6,093 transactions were discovered in **8 signature requests** and the full history was reconstructed in **22.84s** under rate-limited client pacing.
+In the sample above, 6,093 transactions were discovered in **8 signature requests**, the scanner elided 6,092 zero-delta references that did not change the address's native SOL balance, and the balance-changing timeline was reconstructed in **22.84s** under rate-limited client pacing.
 
 ## Why it's fast
 
@@ -216,7 +217,8 @@ The JSON output written to file:
     "signature_requests": 8,
     "full_requests": 61,
     "discovered_signatures": 6093,
-    "fetched_transactions": 6093,
+    "fetched_transactions": 1,
+    "elided_zero_delta_entries": 6092,
     "fetch_jobs": 61,
     "max_discovery_depth": 0
   }
@@ -229,9 +231,9 @@ The JSON output written to file:
 |---|---|
 | `address` | Target wallet address |
 | `strategy` | Which runtime strategy won the classifier (`boundary_only`, `seeded_full_fanout`, `sparse_recursive`, `dense_parallel_range`, `dense_pincer`, or `empty`) |
-| `initial_balance_lamports` | Native SOL balance before the first included transaction |
-| `final_balance_lamports` | Native SOL balance after the last included transaction |
-| `entries` | Per-transaction balance timeline |
+| `initial_balance_lamports` | Native SOL balance before the earliest observed transaction for the address |
+| `final_balance_lamports` | Native SOL balance after the latest observed transaction for the address |
+| `entries` | Per-transaction balance timeline, filtered to balance-changing transactions only |
 | `stats` | Request and discovery counters for the run |
 
 ### Entry fields
@@ -247,6 +249,8 @@ The JSON output written to file:
 | `post_balance_lamports` | Target address balance after the transaction |
 | `delta_lamports` | `post - pre` |
 
+Entries with `delta_lamports = 0` are omitted from the final JSON timeline because they do not change the native SOL balance curve.
+
 ### Stats fields
 
 | Field | Description |
@@ -254,7 +258,8 @@ The JSON output written to file:
 | `signature_requests` | Total signature-mode RPC requests made |
 | `full_requests` | Total full-transaction RPC requests made |
 | `discovered_signatures` | Unique signatures discovered during search |
-| `fetched_transactions` | Transactions in the final timeline |
+| `fetched_transactions` | Balance-changing transactions in the final timeline |
+| `elided_zero_delta_entries` | Zero-delta transactions omitted from the final timeline |
 | `fetch_jobs` | Full-fetch job batches created |
 | `max_discovery_depth` | Deepest recursion level reached during sparse search (0 = no recursion needed) |
 

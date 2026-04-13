@@ -106,6 +106,7 @@ pub struct ScanStats {
     pub full_requests: usize,
     pub discovered_signatures: usize,
     pub fetched_transactions: usize,
+    pub elided_zero_delta_entries: usize,
     pub fetch_jobs: usize,
     pub max_discovery_depth: usize,
 }
@@ -204,6 +205,7 @@ impl StatsTracker {
             full_requests: self.full_requests.load(AtomicOrdering::Relaxed),
             discovered_signatures: 0,
             fetched_transactions: 0,
+            elided_zero_delta_entries: 0,
             fetch_jobs: 0,
             max_discovery_depth: self.max_discovery_depth.load(AtomicOrdering::Relaxed),
         }
@@ -510,18 +512,22 @@ pub async fn reconstruct_sol_balance_timeline(
         };
     sort_and_dedup_full_transactions(&mut full_transactions);
 
-    let entries = build_timeline_entries(address, full_transactions)?;
+    let all_entries = build_timeline_entries(address, full_transactions)?;
+    let initial_balance_lamports = all_entries.first().map(|entry| entry.pre_balance_lamports);
+    let final_balance_lamports = all_entries.last().map(|entry| entry.post_balance_lamports);
+    let (entries, elided_zero_delta_entries) = filter_balance_changing_entries(all_entries);
 
     let mut stats_snapshot = context.stats.snapshot();
     stats_snapshot.discovered_signatures = signatures.len();
     stats_snapshot.fetched_transactions = entries.len();
+    stats_snapshot.elided_zero_delta_entries = elided_zero_delta_entries;
     stats_snapshot.fetch_jobs = fetch_jobs_len;
 
     Ok(TimelineOutput {
         address: address.to_owned(),
         strategy,
-        initial_balance_lamports: entries.first().map(|entry| entry.pre_balance_lamports),
-        final_balance_lamports: entries.last().map(|entry| entry.post_balance_lamports),
+        initial_balance_lamports,
+        final_balance_lamports,
         entries,
         stats: stats_snapshot,
     })
@@ -2354,6 +2360,16 @@ fn build_timeline_entries(
         .collect()
 }
 
+fn filter_balance_changing_entries(entries: Vec<TimelineEntry>) -> (Vec<TimelineEntry>, usize) {
+    let original_len = entries.len();
+    let entries = entries
+        .into_iter()
+        .filter(|entry| entry.delta_lamports != 0)
+        .collect::<Vec<_>>();
+    let elided_zero_delta_entries = original_len.saturating_sub(entries.len());
+    (entries, elided_zero_delta_entries)
+}
+
 fn timeline_entry_for_transaction(
     address: &str,
     transaction: FullTransactionRecord,
@@ -2417,7 +2433,8 @@ mod tests {
 
     use super::{
         FullFetchJob, RuntimeScanConfig, ScanStrategy, SeededDensitySample, StrategyPreference,
-        build_density_weighted_start_slots, build_full_fetch_jobs, build_timeline_entries,
+        TimelineEntry, build_density_weighted_start_slots, build_full_fetch_jobs,
+        build_timeline_entries, filter_balance_changing_entries,
         reconstruct_sol_balance_timeline, sort_and_dedup_signatures,
     };
     use crate::client::{FixtureClient, FixtureData};
@@ -2604,6 +2621,38 @@ mod tests {
         assert_eq!(timeline[0].transaction_index, 9);
     }
 
+    #[test]
+    fn filter_balance_changing_entries_elides_flat_points() {
+        let entries = vec![
+            TimelineEntry {
+                signature: "sig-flat".to_owned(),
+                slot: 1,
+                transaction_index: 0,
+                block_time: Some(1),
+                succeeded: true,
+                pre_balance_lamports: 10,
+                post_balance_lamports: 10,
+                delta_lamports: 0,
+            },
+            TimelineEntry {
+                signature: "sig-change".to_owned(),
+                slot: 2,
+                transaction_index: 0,
+                block_time: Some(2),
+                succeeded: true,
+                pre_balance_lamports: 10,
+                post_balance_lamports: 15,
+                delta_lamports: 5,
+            },
+        ];
+
+        let (filtered, elided) = filter_balance_changing_entries(entries);
+
+        assert_eq!(elided, 1);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].signature, "sig-change");
+    }
+
     #[tokio::test]
     async fn fixture_client_replays_the_full_scan_offline() {
         let fixture = FixtureData {
@@ -2716,6 +2765,38 @@ mod tests {
         assert_eq!(output.entries[1].succeeded, false);
         assert!(output.stats.signature_requests >= 2);
         assert!(output.stats.full_requests >= 2);
+    }
+
+    #[tokio::test]
+    async fn zero_delta_transactions_are_elided_from_output_but_not_balances() {
+        let fixture = FixtureData {
+            address: Some("target".to_owned()),
+            transactions: vec![
+                full_tx("target", "sig-flat-1", 10, 0, 42, 42),
+                full_tx("target", "sig-flat-2", 20, 0, 42, 42),
+            ],
+        };
+
+        let client = FixtureClient::from_fixture(fixture).expect("fixture client");
+        let output = reconstruct_sol_balance_timeline(
+            &client,
+            "target",
+            RuntimeScanConfig {
+                concurrency: 4,
+                scout_limit: 1000,
+                full_limit: 2,
+                rpc_rps: None,
+                strategy_preference: StrategyPreference::Auto,
+            },
+        )
+        .await
+        .expect("scan output");
+
+        assert!(output.entries.is_empty());
+        assert_eq!(output.initial_balance_lamports, Some(42));
+        assert_eq!(output.final_balance_lamports, Some(42));
+        assert_eq!(output.stats.fetched_transactions, 0);
+        assert_eq!(output.stats.elided_zero_delta_entries, 2);
     }
 
     #[tokio::test]
