@@ -54,7 +54,7 @@ struct Cli {
     rpc_rps: Option<u32>,
     #[arg(
         long,
-        help = "Maximum number of concurrent requests/jobs. Defaults to 32, or the configured request cap when using --plan/--rpc-rps."
+        help = "Maximum number of concurrent requests/jobs. Defaults to 32, or a plan-aware ceiling when using --plan/--rpc-rps."
     )]
     concurrency: Option<usize>,
     #[arg(
@@ -97,6 +97,7 @@ enum CliStrategyPreference {
 }
 
 const DEFAULT_CONCURRENCY: usize = 32;
+const MAX_DEFAULT_CONCURRENCY_WITH_PACING: usize = 64;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -318,7 +319,11 @@ fn resolve_concurrency(concurrency: Option<usize>, rpc_rps: Option<u32>) -> usiz
     match concurrency {
         Some(value) => value.max(1),
         None => rpc_rps
-            .map(|value| DEFAULT_CONCURRENCY.max(value as usize))
+            .map(|value| {
+                DEFAULT_CONCURRENCY.max(
+                    (value as usize).min(MAX_DEFAULT_CONCURRENCY_WITH_PACING),
+                )
+            })
             .unwrap_or(DEFAULT_CONCURRENCY),
     }
 }
@@ -491,8 +496,13 @@ mod tests {
     #[test]
     fn resolve_concurrency_tracks_request_cap_when_higher() {
         assert_eq!(resolve_concurrency(None, Some(50)), 50);
-        assert_eq!(resolve_concurrency(None, Some(200)), 200);
-        assert_eq!(resolve_concurrency(None, Some(500)), 500);
+        assert_eq!(resolve_concurrency(None, Some(64)), 64);
+    }
+
+    #[test]
+    fn resolve_concurrency_caps_high_rate_defaults() {
+        assert_eq!(resolve_concurrency(None, Some(200)), 64);
+        assert_eq!(resolve_concurrency(None, Some(500)), 64);
     }
 
     #[test]

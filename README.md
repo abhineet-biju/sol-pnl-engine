@@ -184,7 +184,7 @@ sol-balance-runtime [OPTIONS]
 |---|---|---|
 | `--plan <PLAN>` | - | Helius plan preset for automatic request pacing |
 | `--rpc-rps <N>` | unbounded | Explicit requests-per-second cap (overrides `--plan`) |
-| `--concurrency <N>` | 32 (or `rpc-rps` value if higher) | Maximum concurrent in-flight requests |
+| `--concurrency <N>` | 32 (or up to 64 by default when pacing is enabled) | Maximum concurrent in-flight requests |
 | `--scout-limit <N>` | 1000 | Page size for signature discovery (1–1000) |
 | `--full-limit <N>` | 100 | Page size for full transaction fetches (1–100) |
 | `--strategy-preference <MODE>` | `auto` | Optional override for benchmarking (`auto`, `seeded-full-fanout`, `dense-pincer`, `dense-parallel-range`, `sparse-recursive`) |
