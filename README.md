@@ -1,4 +1,4 @@
-# sol-pnl-engine
+# sol-balance-runtime
 
 Reconstructs a Solana wallet's **native SOL balance over time** using only Helius [`getTransactionsForAddress`](https://www.helius.dev/docs/rpc/gettransactionsforaddress). No indexing, no database, just RPC.
 
@@ -8,22 +8,29 @@ Built for [Mert's latency challenge](https://x.com/mert/status/20429414212970501
 
 > **Latency default:** `--api-key` runs against Helius beta / Gatekeeper-style infrastructure by default for lower latency, and automatically falls back to the standard mainnet endpoint if beta is unavailable. Use `--rpc-url` if you want to force a specific endpoint.
 
-```
-cargo run -- --api-key YOUR_KEY --address 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds
+```bash
+cargo run -- --api-key YOUR_KEY --address 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds --plan developer
 ```
 
-```
+Representative terminal output from the command above:
+
+```text
 scan complete
 source: live
 endpoint: helius beta
 strategy: dense_pincer
 address: 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds
-wall time: 14.56s
+output: outputs/2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds.json
+wall time: 22.84s
 entries: 6093 | signature requests: 8 | full requests: 61
-concurrency: 32 | rpc pacing: unbounded
+concurrency: 50 | rpc pacing: 50 req/s
+http attempts: 69 | retries: 0 | cumulative http time: 500.38s | avg per attempt: 7.25s
+first completed rpc attempt: 2.01s (includes initial connection/TLS setup on a cold client)
 ```
 
-6,093 transactions discovered in **8 signature requests**, full history reconstructed in **14.56s**.
+This is representative live output, not a guaranteed benchmark. Wall time depends on current Helius load, your pacing cap, chosen concurrency, and whether the client is cold or warm.
+
+In the sample above, 6,093 transactions were discovered in **8 signature requests** and the full history was reconstructed in **22.84s** at Developer-plan pacing.
 
 ## Why it's fast
 
@@ -47,7 +54,7 @@ The algorithm exploits `getTransactionsForAddress`'s bidirectional sorting and s
 - **Probe-and-narrow**: when splitting ranges, the algorithm sends single-record probes (`limit=1`) to find the tightest bounding slots on each side before recursing, avoiding wasted requests on empty ranges.
 - **Concurrency-controlled**: all RPC calls go through a shared semaphore (default 32 permits), bounding in-flight requests without serializing independent work.
 
-A naive sequential approach for the 6,093-transaction example above would take ~7 signature pages + ~61 full pages = 68 requests done one at a time. At 1.64s average HTTP time per request, that's **~112s sequential vs 14.56s actual, roughly 8x faster**.
+A naive sequential approach for the 6,093-transaction example above would serialize roughly 68 requests. In practice, the scanner overlaps discovery and retrieval heavily, so wall time stays in the tens of seconds even when the cumulative HTTP time across parallel requests is much higher.
 
 ## Quick start
 
