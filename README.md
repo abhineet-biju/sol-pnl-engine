@@ -9,7 +9,7 @@ Built for [Mert's latency challenge](https://x.com/mert/status/20429414212970501
 > **Latency default:** `--api-key` runs against Helius beta / Gatekeeper-style infrastructure by default for lower latency, and automatically falls back to the standard mainnet endpoint if beta is unavailable. Use `--rpc-url` if you want to force a specific endpoint.
 
 ```bash
-cargo run -- --api-key YOUR_KEY --address 2W2sRxN4ioj5ZJkicCqgr97kzugAHrcYGRWbbbxkqQds --plan professional
+cargo run -- --api-key YOUR_API_KEY --address YOUR_WALLET_ADDRESS --plan professional
 ```
 
 Representative terminal output from a comparable live run:
@@ -52,7 +52,7 @@ The algorithm exploits `getTransactionsForAddress`'s bidirectional sorting and s
 - **Signatures-first discovery**: uses `transactionDetails: signatures` (lightweight) to map the history before requesting full transactions (heavy). This minimizes bandwidth and response times during the search phase.
 - **Adaptive subrange planning**: for sparse wallets, the first page's density is used to estimate optimal slot-range windows. Up to 16 subranges are searched in parallel instead of walking the ledger sequentially.
 - **Probe-and-narrow**: when splitting ranges, the algorithm sends single-record probes (`limit=1`) to find the tightest bounding slots on each side before recursing, avoiding wasted requests on empty ranges.
-- **Concurrency-controlled**: all RPC calls go through a shared semaphore (default 32 permits), bounding in-flight requests without serializing independent work.
+- **Concurrency-controlled**: all RPC calls go through a shared semaphore. Unpaced runs default to 64 permits for better high-headroom throughput; paced runs keep a lower floor and scale with the configured client cap.
 
 A naive sequential approach for the 6,093-transaction example above would serialize roughly 68 requests. In practice, the scanner overlaps discovery and retrieval heavily, so wall time stays in the tens of seconds even when the cumulative HTTP time across parallel requests is much higher.
 
@@ -75,7 +75,7 @@ Reads a local fixture file, simulates RPC paging and slot filtering, runs the fu
 ### Run against live Helius RPC
 
 ```bash
-cargo run -- --api-key YOUR_KEY --address YOUR_WALLET
+cargo run -- --api-key YOUR_API_KEY --address YOUR_WALLET_ADDRESS
 ```
 
 This uses `https://beta.helius-rpc.com/?api-key=...` by default and retries on the standard mainnet endpoint if beta fails.
@@ -83,7 +83,7 @@ This uses `https://beta.helius-rpc.com/?api-key=...` by default and retries on t
 Or with a full RPC URL:
 
 ```bash
-cargo run -- --rpc-url "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY" --address YOUR_WALLET
+cargo run -- --rpc-url "https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY" --address YOUR_WALLET_ADDRESS
 ```
 
 Both `--api-key` and `--rpc-url` can also be set via environment variables (`HELIUS_API_KEY` and `HELIUS_RPC_URL` respectively).
@@ -93,7 +93,7 @@ Both `--api-key` and `--rpc-url` can also be set via environment variables (`HEL
 If your Helius plan has a request cap, use `--plan` to set automatic pacing:
 
 ```bash
-cargo run -- --api-key YOUR_KEY --address YOUR_WALLET --plan professional
+cargo run -- --api-key YOUR_API_KEY --address YOUR_WALLET_ADDRESS --plan professional
 ```
 
 | Plan | Requests/sec |
@@ -106,7 +106,7 @@ cargo run -- --api-key YOUR_KEY --address YOUR_WALLET --plan professional
 Or set an explicit cap with `--rpc-rps`:
 
 ```bash
-cargo run -- --api-key YOUR_KEY --address YOUR_WALLET --rpc-rps 100
+cargo run -- --api-key YOUR_API_KEY --address YOUR_WALLET_ADDRESS --rpc-rps 100
 ```
 
 `--rpc-rps` overrides `--plan` if both are provided.
@@ -184,7 +184,7 @@ sol-balance-runtime [OPTIONS]
 |---|---|---|
 | `--plan <PLAN>` | - | Helius plan preset for client-side request pacing only. Actual server-side limits still depend on the API key's plan |
 | `--rpc-rps <N>` | unbounded | Explicit requests-per-second cap (overrides `--plan`) |
-| `--concurrency <N>` | 32 (or `rpc-rps` value if higher) | Maximum concurrent in-flight requests |
+| `--concurrency <N>` | 64 when unpaced, otherwise `max(32, rpc-rps)` | Maximum concurrent in-flight requests |
 | `--scout-limit <N>` | 1000 | Page size for signature discovery (1–1000) |
 | `--full-limit <N>` | 100 | Page size for full transaction fetches (1–100) |
 | `--strategy-preference <MODE>` | `auto` | Optional override for benchmarking (`auto`, `seeded-full-fanout`, `dense-pincer`, `dense-parallel-range`, `sparse-recursive`) |

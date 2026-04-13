@@ -96,7 +96,8 @@ enum CliStrategyPreference {
     SparseRecursive,
 }
 
-const DEFAULT_CONCURRENCY: usize = 32;
+const PACED_MIN_CONCURRENCY: usize = 32;
+const UNPACED_DEFAULT_CONCURRENCY: usize = 64;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -318,8 +319,8 @@ fn resolve_concurrency(concurrency: Option<usize>, rpc_rps: Option<u32>) -> usiz
     match concurrency {
         Some(value) => value.max(1),
         None => rpc_rps
-            .map(|value| DEFAULT_CONCURRENCY.max(value as usize))
-            .unwrap_or(DEFAULT_CONCURRENCY),
+            .map(|value| PACED_MIN_CONCURRENCY.max(value as usize))
+            .unwrap_or(UNPACED_DEFAULT_CONCURRENCY),
     }
 }
 
@@ -428,8 +429,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        DEFAULT_CONCURRENCY, HeliusPlan, build_beta_helius_rpc_url, build_default_helius_rpc_url,
-        build_mainnet_helius_rpc_url, default_output_path, resolve_concurrency, resolve_rpc_rps,
+        HeliusPlan, PACED_MIN_CONCURRENCY, UNPACED_DEFAULT_CONCURRENCY,
+        build_beta_helius_rpc_url, build_default_helius_rpc_url, build_mainnet_helius_rpc_url,
+        default_output_path, resolve_concurrency, resolve_rpc_rps,
     };
 
     #[test]
@@ -485,7 +487,7 @@ mod tests {
 
     #[test]
     fn resolve_concurrency_defaults_to_base_without_rate_cap() {
-        assert_eq!(resolve_concurrency(None, None), DEFAULT_CONCURRENCY);
+        assert_eq!(resolve_concurrency(None, None), UNPACED_DEFAULT_CONCURRENCY);
     }
 
     #[test]
@@ -493,6 +495,11 @@ mod tests {
         assert_eq!(resolve_concurrency(None, Some(50)), 50);
         assert_eq!(resolve_concurrency(None, Some(200)), 200);
         assert_eq!(resolve_concurrency(None, Some(500)), 500);
+    }
+
+    #[test]
+    fn resolve_concurrency_keeps_minimum_when_paced_cap_is_lower() {
+        assert_eq!(resolve_concurrency(None, Some(10)), PACED_MIN_CONCURRENCY);
     }
 
     #[test]
